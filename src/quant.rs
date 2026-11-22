@@ -12,6 +12,7 @@
 //! - `Q3_K`:  w0 = raw 110-byte superblocks padded to 112 bytes (28 words), w1 unused.
 //! - `IQ3_S`: w0 = raw 110-byte superblocks padded to 112 bytes (28 words), w1 = codebook.
 //! - `IQ2_S`: w0 = raw 82-byte superblocks padded to 84 bytes (21 words), w1 = codebook.
+//! - `NVFP4`, `IQ2_XXS`, `IQ2_XS`, `IQ4_NL`: host-dequantized into F32 words like `Q5_1`.
 
 use anyhow::{Result, bail};
 use half::f16;
@@ -32,6 +33,10 @@ pub enum GgmlType {
     Iq2S,
     Bf16,
     Mxfp4,
+    Nvfp4,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq4Nl,
 }
 
 impl GgmlType {
@@ -50,6 +55,10 @@ impl GgmlType {
             22 => Self::Iq2S,
             30 => Self::Bf16,
             39 => Self::Mxfp4,
+            40 => Self::Nvfp4,
+            16 => Self::Iq2Xxs,
+            17 => Self::Iq2Xs,
+            20 => Self::Iq4Nl,
             _ => bail!("unsupported ggml type {v}"),
         })
     }
@@ -69,6 +78,10 @@ impl GgmlType {
             Self::Iq3Xxs => (256, 98),
             Self::Iq2S => (256, 82),
             Self::Mxfp4 => (32, 17),
+            Self::Nvfp4 => (64, 36),
+            Self::Iq2Xxs => (256, 66),
+            Self::Iq2Xs => (256, 74),
+            Self::Iq4Nl => (32, 18),
         }
     }
 
@@ -83,7 +96,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => fmt::F32,
             // Host-dequantized into F32 words by `repack`; no dedicated GPU kernel.
-            Self::Q5_1 => fmt::F32,
+            Self::Q5_1 | Self::Nvfp4 | Self::Iq2Xxs | Self::Iq2Xs | Self::Iq4Nl => fmt::F32,
             Self::Q8_0 => fmt::Q8_0,
             Self::Mxfp4 => fmt::MXFP4,
             Self::Q5K => fmt::Q5K,
@@ -173,6 +186,25 @@ fn e8m0_half(e: u8) -> f32 {
     }
 }
 
+/// UE4M3 scale (4 exponent bits, bias 7, 3 mantissa bits), halved to match the doubled
+/// E2M1 table, as in ggml's `ggml_ue4m3_to_fp32`.
+fn ue4m3_half(e: u8) -> f32 {
+    if e == 0 || e == 0x7F {
+        return 0.0;
+    }
+    let (exp, man) = ((e >> 3) as i32 & 0xF, (e & 7) as f32);
+    let raw = if exp == 0 {
+        man * (-9f32).exp2()
+    } else {
+        (1.0 + man / 8.0) * ((exp - 7) as f32).exp2()
+    };
+    raw * 0.5
+}
+
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
 fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
@@ -226,6 +258,38 @@ pub fn dequant(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                     y[j] = d * MXFP4_VALUES[(b[1 + j] & 0xF) as usize] as f32;
                     y[j + 16] = d * MXFP4_VALUES[(b[1 + j] >> 4) as usize] as f32;
                 }
+            }
+        }
+        GgmlType::Nvfp4 => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                for s in 0..4 {
+                    let d = ue4m3_half(b[s]);
+                    let qs = &b[4 + 8 * s..4 + 8 * s + 8];
+                    let ys = &mut y[16 * s..16 * s + 16];
+                    for j in 0..8 {
+                        ys[j] = d * MXFP4_VALUES[(qs[j] & 0xF) as usize] as f32;
+                        ys[j + 8] = d * MXFP4_VALUES[(qs[j] >> 4) as usize] as f32;
+                    }
+                }
+            }
+        }
+        GgmlType::Iq4Nl => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for j in 0..16 {
+                    y[j] = d * KVALUES_IQ4NL[(b[2 + j] & 0xF) as usize] as f32;
+                    y[j + 16] = d * KVALUES_IQ4NL[(b[2 + j] >> 4) as usize] as f32;
+                }
+            }
+        }
+        GgmlType::Iq2Xxs => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                iq2xxs_block(b, y);
+            }
+        }
+        GgmlType::Iq2Xs => {
+            for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                iq2xs_block(b, y);
             }
         }
         GgmlType::Q5K => {
@@ -409,6 +473,47 @@ fn iq2s_block(b: &[u8], y: &mut [f32]) {
     }
 }
 
+fn iq2xxs_block(b: &[u8], y: &mut [f32]) {
+    use crate::iq_grids::IQ2XXS_GRID;
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let qs = &b[2..66];
+    for ib in 0..8 {
+        let q = &qs[8 * ib..8 * ib + 8];
+        let aux1 = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+        let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let grid = IQ2XXS_GRID[q[l] as usize].to_le_bytes();
+            let sg = ksign(((aux1 >> (7 * l)) & 127) as usize);
+            for j in 0..8 {
+                let s = if sg & (1 << j) != 0 { -1.0 } else { 1.0 };
+                y[ib * 32 + l * 8 + j] = db * grid[j] as f32 * s;
+            }
+        }
+    }
+}
+
+fn iq2xs_block(b: &[u8], y: &mut [f32]) {
+    use crate::iq_grids::IQ2XS_GRID;
+    let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let (qs, scales) = (&b[2..66], &b[66..74]);
+    for ib in 0..8 {
+        let db = [
+            d * (0.5 + (scales[ib] & 0xF) as f32) * 0.25,
+            d * (0.5 + (scales[ib] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let k = 4 * ib + l;
+            let q = u16::from_le_bytes([qs[2 * k], qs[2 * k + 1]]);
+            let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+            let sg = ksign((q >> 9) as usize);
+            for j in 0..8 {
+                let s = if sg & (1 << j) != 0 { -1.0 } else { 1.0 };
+                y[ib * 32 + l * 8 + j] = db[l / 2] * grid[j] as f32 * s;
+            }
+        }
+    }
+}
+
 /// A tensor repacked into the GPU layout described in the module docs.
 pub struct Packed {
     pub fmt: u32,
@@ -428,7 +533,7 @@ pub fn repack(ty: GgmlType, src: &[u8]) -> Packed {
     let mut w1 = vec![0u32; fmt::w1_words(f, numel)];
     match ty {
         GgmlType::F32 | GgmlType::Q5K => copy_words(&mut w0, src),
-        GgmlType::Q5_1 => {
+        GgmlType::Q5_1 | GgmlType::Nvfp4 | GgmlType::Iq2Xxs | GgmlType::Iq2Xs | GgmlType::Iq4Nl => {
             // Rare in practice (14 tensors in Inkling-2 APEX Balanced): dequantize on the
             // host and reuse the F32 GPU path instead of adding a dedicated kernel.
             let mut f = vec![0f32; numel];
