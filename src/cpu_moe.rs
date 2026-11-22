@@ -335,7 +335,13 @@ fn dot_scalar(ty: GgmlType, src: &[u8], x: &[f32]) -> f32 {
             crate::quant::dequant(ty, src, &mut tmp);
             sum = tmp.iter().zip(x).map(|(a, b)| a * b).sum();
         }
-        GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q5_1 => {
+        GgmlType::Q4K
+        | GgmlType::Q3K
+        | GgmlType::Q5_1
+        | GgmlType::Nvfp4
+        | GgmlType::Iq2Xxs
+        | GgmlType::Iq2Xs
+        | GgmlType::Iq4Nl => {
             let mut tmp = vec![0.0f32; x.len()];
             crate::quant::dequant(ty, src, &mut tmp);
             sum = tmp.iter().zip(x).map(|(a, b)| a * b).sum();

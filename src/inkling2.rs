@@ -464,6 +464,16 @@ impl<'a> Model<'a> {
         Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
     }
 
+    /// Per-expert output scale (`<weight>.scale`, one f32 per expert); empty when absent.
+    fn expert_scale(&self, weight: &str) -> Result<Vec<f32>> {
+        let name = format!("{}.scale", weight.trim_end_matches(".weight"));
+        if self.g.tensors.contains_key(&name) {
+            self.f32_vec(&name)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// One expert's slice of a 3-D [rows, cols, experts] tensor.
     fn expert(&self, name: &str, e: usize) -> Result<(GgmlType, &[u8], usize, usize)> {
         let (t, raw) = self.tensor(name)?;
@@ -492,7 +502,8 @@ impl<'a> Model<'a> {
         let (_, raw) = self.tensor(weight_name)?;
         let channels = cur.len();
         let w: &[f32] = bytemuck::cast_slice(&raw[..self.cfg.conv * channels * 4]);
-        let hist = &mut st.conv[slot][offset..offset + (self.cfg.conv - 1) * channels];
+        let start = offset * (self.cfg.conv - 1);
+        let hist = &mut st.conv[slot][start..start + (self.cfg.conv - 1) * channels];
         Ok(convolve(
             cur,
             w,
@@ -513,9 +524,13 @@ impl<'a> Model<'a> {
         let mut out = vec![0.0f32; (extent + 1) * heads];
         for d in 0..=extent {
             for h in 0..heads {
+                // ggml layout: table is (rel_len, extent) with rel_len contiguous, padded
+                // with one zero row at distance `extent`; r is (rel_len, heads).
                 let mut s = 0.0f32;
-                for i in 0..rel_len {
-                    s += table[i * extent + d.min(extent - 1)] * r[i * heads + h];
+                if d < extent {
+                    for i in 0..rel_len {
+                        s += table[d * rel_len + i] * r[h * rel_len + i];
+                    }
                 }
                 out[d * heads + h] = s - sinks[h];
             }
@@ -738,10 +753,15 @@ impl<'a> Model<'a> {
         let expert_in = cur.clone();
         let wsum: f32 = selected.iter().map(|&(_, e)| probs[e]).sum::<f32>() + 1e-20;
         cur = vec![0.0f32; hidden];
+        let gu_scale = self.expert_scale(&format!("{b}ffn_gate_up_exps.weight"))?;
+        let dn_scale = self.expert_scale(&format!("{b}ffn_down_exps.weight"))?;
         for &(_, e) in &selected {
             let (gu_ty, gu, gu_rows, gu_cols) =
                 self.expert(&format!("{b}ffn_gate_up_exps.weight"), e)?;
-            let guv = matvec_gguf(gu_ty, gu, gu_rows, gu_cols, &expert_in);
+            let mut guv = matvec_gguf(gu_ty, gu, gu_rows, gu_cols, &expert_in);
+            if !gu_scale.is_empty() {
+                guv.iter_mut().for_each(|v| *v *= gu_scale[e]);
+            }
             let ff = gu_rows / 2;
             let act: Vec<f32> = guv[..ff]
                 .iter()
@@ -754,7 +774,10 @@ impl<'a> Model<'a> {
                 .collect();
             let (dn_ty, dn, dn_rows, dn_cols) =
                 self.expert(&format!("{b}ffn_down_exps.weight"), e)?;
-            let down = matvec_gguf(dn_ty, dn, dn_rows, dn_cols, &act);
+            let mut down = matvec_gguf(dn_ty, dn, dn_rows, dn_cols, &act);
+            if !dn_scale.is_empty() {
+                down.iter_mut().for_each(|v| *v *= dn_scale[e]);
+            }
             let w = probs[e] / wsum * cfg.expert_scale;
             for (c, d) in cur.iter_mut().zip(down) {
                 *c += w * d;
