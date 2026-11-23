@@ -513,6 +513,36 @@ fn slot_write_test(gpu: &Gpu) -> Result<()> {
 
 /// Grouped expert kernels against CPU, with experts written into non-zero pool slots.
 fn moe_test(gpu: &Gpu, g: &Gguf, rng: &mut Rng) -> Result<()> {
+    // Fused shared-expert gate+up+SwiGLU against CPU reference.
+    {
+        let gt = g.tensor("blk.0.ffn_gate_shexp.weight")?;
+        let ut = g.tensor("blk.0.ffn_up_shexp.weight")?;
+        let (k, n) = (gt.dims[0] as usize, gt.dims[1] as usize);
+        let gw = qweight(gpu, gt.ty, g.bytes(gt), n, k);
+        let uw = qweight(gpu, ut.ty, g.bytes(ut), n, k);
+        let mut g_cpu = vec![0f32; n * k];
+        let mut u_cpu = vec![0f32; n * k];
+        quant::dequant(gt.ty, g.bytes(gt), &mut g_cpu);
+        quant::dequant(ut.ty, g.bytes(ut), &mut u_cpu);
+        for m in [1usize, 2, 3] {
+            let x = rng.vec(m * k);
+            let xb = gpu.upload_f32(&x);
+            let got = gpu.linear_swiglu(&gw, &uw, &xb, m, 80);
+            let g_out = cpu_matmul(&g_cpu, &x, n, k, m);
+            let u_out = cpu_matmul(&u_cpu, &x, n, k, m);
+            let want: Vec<f32> = g_out
+                .iter()
+                .zip(&u_out)
+                .map(|(&gv, &uv)| gv / (1.0 + (-gv).exp()) * uv)
+                .collect();
+            check(
+                &format!("linear_swiglu Q8_0 m={m}"),
+                &gpu.read_f32(&got),
+                &want,
+                1e-4,
+            )?;
+        }
+    }
     for layer in [0usize, 10] {
         let (inter, hidden, topk) = (512usize, 2048usize, 8usize);
         let experts = [5usize, 77, 200];
@@ -753,7 +783,14 @@ fn gdn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
     let csnap = gpu.alloc((t - 1) * 3 * c);
     let ssnap = gpu.alloc((t - 1) * nv * dk * dk);
     let (xb, wb) = (gpu.upload_f32(&x), gpu.upload_f32(&conv_w));
-    let conv_s = gpu.gdn_conv(&xb, &wb, &gpu.upload_f32(&state0), Some(&csnap), c, t);
+    let conv_s = gpu.gdn_conv(
+        &xb,
+        &wb,
+        &gpu.upload_f32(&state0),
+        Some((&csnap, t - 1)),
+        c,
+        t,
+    );
     check("gdn conv (snap)", &gpu.read_f32(&conv_s), &conv, 1e-5)?;
     let _ = gpu.gdn_recurrent(
         &conv_s,
@@ -764,7 +801,7 @@ fn gdn_test(gpu: &Gpu, rng: &mut Rng) -> Result<()> {
         &gpu.upload_f32(&dt_bias),
         &gpu.upload_f32(&norm_w),
         &gpu.upload_f32(&s0),
-        Some(&ssnap),
+        Some((&ssnap, t - 1)),
         t,
         nk,
         nv,

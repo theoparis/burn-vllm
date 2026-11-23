@@ -194,11 +194,19 @@ impl Config {
     }
 }
 
+enum GdnProj {
+    /// Concatenated `[qkv | z | alpha | beta]` projection in a single weight matrix.
+    Fused(QWeight),
+    Split {
+        qkv: QWeight,
+        z: QWeight,
+        alpha: QWeight,
+        beta: QWeight,
+    },
+}
+
 struct GdnW {
-    qkv: QWeight,
-    z: QWeight,
-    alpha: QWeight,
-    beta: QWeight,
+    proj: GdnProj,
     out: QWeight,
     conv_w: Buf,
     ssm_a: Buf,
@@ -206,10 +214,18 @@ struct GdnW {
     norm: Buf,
 }
 
+enum AttnProj {
+    /// Concatenated `[q | k | v]` projection in a single weight matrix.
+    Fused(QWeight),
+    Split {
+        q: QWeight,
+        k: QWeight,
+        v: QWeight,
+    },
+}
+
 struct AttnW {
-    q: QWeight,
-    k: QWeight,
-    v: QWeight,
+    proj: AttnProj,
     o: QWeight,
     q_norm: Buf,
     k_norm: Buf,
@@ -562,6 +578,55 @@ fn upload_weight(gpu: &Gpu, g: &Gguf, name: &str) -> Result<QWeight> {
     })
 }
 
+/// Concatenate multiple `[n_i, k]` weights vertically into a single `[sum(n_i), k]` `QWeight`
+/// when they share the same quant type, `k`, and scale-word alignment.
+fn try_upload_concat_weights(gpu: &Gpu, g: &Gguf, names: &[&str]) -> Result<Option<QWeight>> {
+    let mut infos = Vec::with_capacity(names.len());
+    for &name in names {
+        let t = g.tensor(name)?;
+        ensure!(t.dims.len() == 2, "{name}: expected 2-D, got {:?}", t.dims);
+        infos.push(t);
+    }
+    let ty = infos[0].ty;
+    let k = infos[0].dims[0] as usize;
+    let f = ty.gpu_fmt();
+    if infos.iter().any(|t| t.ty != ty || t.dims[0] as usize != k) {
+        return Ok(None);
+    }
+    let align = match f {
+        fmt::Q8_0 => 2,
+        fmt::MXFP4 => 4,
+        _ => 1,
+    };
+    if infos
+        .iter()
+        .any(|t| ((t.dims[1] as usize * k) / 32) % align != 0)
+    {
+        return Ok(None);
+    }
+    let mut w0 = Vec::new();
+    let mut w1 = Vec::new();
+    let mut total_n = 0usize;
+    let has_per_block_w1 = matches!(f, fmt::Q8_0 | fmt::MXFP4);
+    for t in infos {
+        let p = quant::repack(t.ty, g.bytes(t));
+        w0.extend_from_slice(&p.w0);
+        if has_per_block_w1 {
+            w1.extend_from_slice(&p.w1);
+        } else if w1.is_empty() {
+            w1 = p.w1;
+        }
+        total_n += t.dims[1] as usize;
+    }
+    Ok(Some(QWeight {
+        fmt: f,
+        k,
+        n: total_n,
+        w0: gpu.upload_u32(&w0),
+        w1: gpu.upload_u32(&w1),
+    }))
+}
+
 fn f32_tensor(g: &Gguf, name: &str) -> Result<Vec<f32>> {
     let t = g.tensor(name)?;
     let mut v = vec![0f32; t.numel() as usize];
@@ -655,20 +720,40 @@ impl Model {
                 for i in 0..cfg.n_layers + cfg.n_mtp {
                     let is_mtp = i >= cfg.n_layers;
                     let mixer = if cfg.is_full_attn(i) || is_mtp {
+                        let qn = blk(i, "attn_q.weight");
+                        let kn = blk(i, "attn_k.weight");
+                        let vn = blk(i, "attn_v.weight");
+                        let proj = match try_upload_concat_weights(gpu_ref, g, &[&qn, &kn, &vn])? {
+                            Some(fused) => AttnProj::Fused(fused),
+                            None => AttnProj::Split {
+                                q: upload_weight(gpu_ref, g, &qn)?,
+                                k: upload_weight(gpu_ref, g, &kn)?,
+                                v: upload_weight(gpu_ref, g, &vn)?,
+                            },
+                        };
                         Mixer::Attn(AttnW {
-                            q: upload_weight(gpu_ref, g, &blk(i, "attn_q.weight"))?,
-                            k: upload_weight(gpu_ref, g, &blk(i, "attn_k.weight"))?,
-                            v: upload_weight(gpu_ref, g, &blk(i, "attn_v.weight"))?,
+                            proj,
                             o: upload_weight(gpu_ref, g, &blk(i, "attn_output.weight"))?,
                             q_norm: upload_f32(gpu_ref, g, &blk(i, "attn_q_norm.weight"))?,
                             k_norm: upload_f32(gpu_ref, g, &blk(i, "attn_k_norm.weight"))?,
                         })
                     } else {
+                        let qkvn = blk(i, "attn_qkv.weight");
+                        let zn = blk(i, "attn_gate.weight");
+                        let an = blk(i, "ssm_alpha.weight");
+                        let bn = blk(i, "ssm_beta.weight");
+                        let proj =
+                            match try_upload_concat_weights(gpu_ref, g, &[&qkvn, &zn, &an, &bn])? {
+                                Some(fused) => GdnProj::Fused(fused),
+                                None => GdnProj::Split {
+                                    qkv: upload_weight(gpu_ref, g, &qkvn)?,
+                                    z: upload_weight(gpu_ref, g, &zn)?,
+                                    alpha: upload_weight(gpu_ref, g, &an)?,
+                                    beta: upload_weight(gpu_ref, g, &bn)?,
+                                },
+                            };
                         Mixer::Gdn(GdnW {
-                            qkv: upload_weight(gpu_ref, g, &blk(i, "attn_qkv.weight"))?,
-                            z: upload_weight(gpu_ref, g, &blk(i, "attn_gate.weight"))?,
-                            alpha: upload_weight(gpu_ref, g, &blk(i, "ssm_alpha.weight"))?,
-                            beta: upload_weight(gpu_ref, g, &blk(i, "ssm_beta.weight"))?,
+                            proj,
                             out: upload_weight(gpu_ref, g, &blk(i, "ssm_out.weight"))?,
                             conv_w: upload_f32(gpu_ref, g, &blk(i, "ssm_conv1d.weight"))?,
                             ssm_a: upload_f32(gpu_ref, g, &blk(i, "ssm_a"))?,
@@ -1061,9 +1146,7 @@ impl Model {
                     .rmsnorm(&x, &self.layers[li].post_norm, t, c.hidden, c.eps);
                 if self.cfg.n_experts == 0 {
                     let d = &self.denses[li];
-                    let g = self.gpu.linear(&d.gate, &h2, t, gm);
-                    let u = self.gpu.linear(&d.up, &h2, t, gm);
-                    let a = self.gpu.swiglu(&g, &u, t * c.dense_inter);
+                    let a = self.gpu.linear_swiglu(&d.gate, &d.up, &h2, t, gm);
                     self.gpu.linear_acc(&d.down, &a, t, &x, gm);
                 } else {
                     self.moe(li, &h2, &x, t, &mut pending_promo)?;
@@ -1096,6 +1179,7 @@ impl Model {
         self.gpu.qmatmul(&self.lm_head, &xn, rows, &logits, false);
         // Overlap any final-layer promotion repack with the ~2 ms lm_head matmul.
         if let Some((prev_li, prev_e, prev_slot)) = pending_promo.take() {
+            self.gpu.flush();
             let tl = Instant::now();
             let packed = self.moes[prev_li].experts.repack_one(&self.gguf, prev_e);
             self.moes[prev_li]
@@ -1116,6 +1200,84 @@ impl Model {
             tokens: tokens_out,
             hidden: xn_all,
         })
+    }
+
+    /// Project Q/K/V and run `attn_prep_paged`; returns `(q, qg_buf, qg_stride)`.
+    fn attn_proj_prep(
+        &self,
+        w: &AttnW,
+        h: &Buf,
+        t: usize,
+        ai: usize,
+        pos: usize,
+        st: &State,
+    ) -> (Buf, Buf, usize) {
+        let c = &self.cfg;
+        let gm = self.gemm_min_m;
+        let gpu = &self.gpu;
+        let (kp, vp) = (&self.kv_pool.k_pools[ai], &self.kv_pool.v_pools[ai]);
+        match &w.proj {
+            AttnProj::Fused(w_qkv) => {
+                let qkv = gpu.linear(w_qkv, h, t, gm);
+                let qg_w = c.n_heads * 2 * c.head_dim;
+                let kv_w = c.n_kv * c.head_dim;
+                let stride = qg_w + 2 * kv_w;
+                let q = gpu.attn_prep_paged_strided(
+                    &qkv,
+                    stride,
+                    &qkv,
+                    stride,
+                    qg_w,
+                    &qkv,
+                    stride,
+                    qg_w + kv_w,
+                    &w.q_norm,
+                    &w.k_norm,
+                    kp,
+                    vp,
+                    &st.page_table_buf,
+                    t,
+                    c.n_heads,
+                    c.n_kv,
+                    c.head_dim,
+                    pos,
+                    KV_PAGE_SIZE,
+                    c.rope_dim,
+                    c.rope_theta,
+                    c.eps,
+                );
+                (q, qkv, stride)
+            }
+            AttnProj::Split {
+                q: wq,
+                k: wk,
+                v: wv,
+            } => {
+                let qg = gpu.linear(wq, h, t, gm);
+                let k = gpu.linear(wk, h, t, gm);
+                let v = gpu.linear(wv, h, t, gm);
+                let q = gpu.attn_prep_paged(
+                    &qg,
+                    &k,
+                    &v,
+                    &w.q_norm,
+                    &w.k_norm,
+                    kp,
+                    vp,
+                    &st.page_table_buf,
+                    t,
+                    c.n_heads,
+                    c.n_kv,
+                    c.head_dim,
+                    pos,
+                    KV_PAGE_SIZE,
+                    c.rope_dim,
+                    c.rope_theta,
+                    c.eps,
+                );
+                (q, qg, c.n_heads * 2 * c.head_dim)
+            }
+        }
     }
 
     /// Enqueue layer `li`'s token mixer for the `t` rows of `x` (absolute position `pos`),
@@ -1142,79 +1304,94 @@ impl Model {
                         view(&st.ssm_snap[li], ssm_sz, s),
                     )
                 });
-                let (conv_snap, ssm_snap) = snaps.clone().unwrap_or((None, None));
+                let (conv_snap, ssm_snap) = snaps.unwrap_or((None, None));
+                let snap_cnt = snap.map_or(0, |s| if s.save_last { t } else { t - 1 });
                 let state_conv = st.conv[li].as_ref().unwrap();
                 let state_ssm = st.ssm[li].as_ref().unwrap();
-                let qkv = gpu.linear(&w.qkv, &h, t, gm);
-                let z = gpu.linear(&w.z, &h, t, gm);
-                let a = gpu.linear(&w.alpha, &h, t, gm);
-                let b = gpu.linear(&w.beta, &h, t, gm);
-                let conv = gpu.gdn_conv(
-                    &qkv,
-                    &w.conv_w,
-                    state_conv,
-                    conv_snap.as_ref().filter(|_| t > 1),
-                    c.conv_dim(),
-                    t,
-                );
-                let o = gpu.gdn_recurrent(
-                    &conv,
-                    &a,
-                    &b,
-                    &z,
-                    &w.ssm_a,
-                    &w.dt_bias,
-                    &w.norm,
-                    state_ssm,
-                    ssm_snap.as_ref().filter(|_| t > 1),
-                    t,
-                    c.ssm_nk,
-                    c.ssm_nv,
-                    c.ssm_dk,
-                    c.eps,
-                );
-                // The kernels skip the last token's state; a micro-batch followed by
-                // another in the same window must save it too.
-                if let (Some(s), Some(cs), Some(ss)) = (snap, conv_snap, ssm_snap)
-                    && s.save_last
-                {
-                    let last = |b: &Buf, sz: usize| Buf {
-                        h: b.h.clone().offset_start(((t - 1) * sz * 4) as u64),
-                        len: sz,
-                    };
-                    gpu.copy_f32(&last(&cs, conv_sz), state_conv, 0, conv_sz);
-                    gpu.copy_f32(&last(&ss, ssm_sz), state_ssm, 0, ssm_sz);
-                }
+                let o = match &w.proj {
+                    GdnProj::Fused(w_all) => {
+                        let all = gpu.linear(w_all, &h, t, gm);
+                        let cdim = c.conv_dim();
+                        let z_dim = c.ssm_nv * c.ssm_dk;
+                        let stride = cdim + z_dim + 2 * c.ssm_nv;
+                        let conv = gpu.gdn_conv_strided(
+                            &all,
+                            &w.conv_w,
+                            state_conv,
+                            conv_snap.as_ref().map(|b| (b, snap_cnt)),
+                            cdim,
+                            stride,
+                            t,
+                        );
+                        gpu.gdn_recurrent_strided(
+                            &conv,
+                            &all,
+                            stride,
+                            cdim + z_dim,
+                            &all,
+                            stride,
+                            cdim + z_dim + c.ssm_nv,
+                            &all,
+                            stride,
+                            cdim,
+                            &w.ssm_a,
+                            &w.dt_bias,
+                            &w.norm,
+                            state_ssm,
+                            ssm_snap.as_ref().map(|b| (b, snap_cnt)),
+                            t,
+                            c.ssm_nk,
+                            c.ssm_nv,
+                            c.ssm_dk,
+                            c.eps,
+                        )
+                    }
+                    GdnProj::Split {
+                        qkv,
+                        z,
+                        alpha,
+                        beta,
+                    } => {
+                        let qkv = gpu.linear(qkv, &h, t, gm);
+                        let z = gpu.linear(z, &h, t, gm);
+                        let a = gpu.linear(alpha, &h, t, gm);
+                        let b = gpu.linear(beta, &h, t, gm);
+                        let conv = gpu.gdn_conv(
+                            &qkv,
+                            &w.conv_w,
+                            state_conv,
+                            conv_snap.as_ref().map(|b| (b, snap_cnt)),
+                            c.conv_dim(),
+                            t,
+                        );
+                        gpu.gdn_recurrent(
+                            &conv,
+                            &a,
+                            &b,
+                            &z,
+                            &w.ssm_a,
+                            &w.dt_bias,
+                            &w.norm,
+                            state_ssm,
+                            ssm_snap.as_ref().map(|b| (b, snap_cnt)),
+                            t,
+                            c.ssm_nk,
+                            c.ssm_nv,
+                            c.ssm_dk,
+                            c.eps,
+                        )
+                    }
+                };
                 gpu.linear_acc(&w.out, &o, t, x, gm);
             }
             Mixer::Attn(w) => {
                 let ai = self.attn_idx[li].expect("full-attn layer index");
                 let (kp, vp) = (&self.kv_pool.k_pools[ai], &self.kv_pool.v_pools[ai]);
-                let qg = gpu.linear(&w.q, &h, t, gm);
-                let k = gpu.linear(&w.k, &h, t, gm);
-                let v = gpu.linear(&w.v, &h, t, gm);
-                let q = gpu.attn_prep_paged(
-                    &qg,
-                    &k,
-                    &v,
-                    &w.q_norm,
-                    &w.k_norm,
-                    kp,
-                    vp,
-                    &st.page_table_buf,
-                    t,
-                    c.n_heads,
-                    c.n_kv,
-                    c.head_dim,
-                    pos,
-                    KV_PAGE_SIZE,
-                    c.rope_dim,
-                    c.rope_theta,
-                    c.eps,
-                );
-                let o = gpu.attention_paged(
+                let (q, qg, qg_stride) = self.attn_proj_prep(w, &h, t, ai, pos, st);
+                let o = gpu.attention_paged_strided(
                     &q,
                     &qg,
+                    qg_stride,
                     kp,
                     vp,
                     &st.page_table_buf,
@@ -1280,13 +1457,17 @@ impl Model {
             }),
         ];
         let pos = st.pos;
-        let mut routed = [Some(self.mix_route(0, &xs[0], ta, pos, st, snaps[0])), None];
+        let read_client = self.gpu.client.clone();
+        let r0 = self.mix_route(0, &xs[0], ta, pos, st, snaps[0]);
+        let f0 = Gpu::read_u32_async(&read_client, &r0.1.pack);
+        let mut routed = [Some((r0.0, r0.1, f0)), None];
         let mut ready_promo: Option<(usize, usize, usize, [quant::Packed; 3])> = None;
+        let mut pending_finish: Option<(usize, MoeJob)> = None;
         for li in 0..n_layers {
             for m in 0..2 {
-                let (h2, r) = routed[m].take().expect("micro-batch routed");
+                let (h2, r, pack_fut) = routed[m].take().expect("micro-batch routed");
                 let ts = Instant::now();
-                let pack_host = self.gpu.read_u32(&r.pack);
+                let pack_host = pack_fut.wait();
                 self.stats.route_sync_secs += ts.elapsed().as_secs_f64();
                 if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo.take() {
                     let tl = Instant::now();
@@ -1297,17 +1478,37 @@ impl Model {
                     self.stats.upload_secs += tl.elapsed().as_secs_f64();
                     self.stats.promotions += 1;
                 }
-                let mut job = self.moe_begin_host(li, &h2, mb[m].1, &pack_host, r, pending);
+                let prev_fin = pending_finish.take().map(|(pm, pjob)| {
+                    let cpu = (!pjob.misses.is_empty()).then(|| self.gpu.upload_f32(&pjob.pack));
+                    (&xs[pm], pjob, cpu)
+                });
+                let mut job =
+                    self.moe_begin_host(li, &h2, mb[m].1, &pack_host, r, pending, prev_fin);
                 let promo_req = pending.take();
                 let (nli, nm) = if m == 0 { (li, 1) } else { (li + 1, 0) };
                 let this = &*self;
+                let rc = &read_client;
                 let tc = Instant::now();
                 let (next_routed, next_ready) = cpu_moe::overlap(
                     || this.moe_cpu(&mut job),
                     || {
-                        let nr = (nli < n_layers).then(|| {
-                            this.mix_route(nli, &xs[nm], mb[nm].1, pos + mb[nm].0, st, snaps[nm])
-                        });
+                        let nr = if nli < n_layers {
+                            let (nh2, nr) = this.mix_route(
+                                nli,
+                                &xs[nm],
+                                mb[nm].1,
+                                pos + mb[nm].0,
+                                st,
+                                snaps[nm],
+                            );
+                            // Issue the async readback immediately so wgpu submits the whole
+                            // compute pass + staging copy in one queue.submit() while moe_cpu runs.
+                            let nf = Gpu::read_u32_async(rc, &nr.pack);
+                            Some((nh2, nr, nf))
+                        } else {
+                            this.gpu.flush();
+                            None
+                        };
                         let np = promo_req.map(|(p_li, p_e, p_slot)| {
                             let p = this.moes[p_li].experts.repack_one(&this.gguf, p_e);
                             (p_li, p_e, p_slot, p)
@@ -1318,8 +1519,11 @@ impl Model {
                 ready_promo = next_ready;
                 self.stats.cpu_secs += tc.elapsed().as_secs_f64();
                 routed[nm] = next_routed;
-                self.moe_finish(&xs[m], job);
+                pending_finish = Some((m, job));
             }
+        }
+        if let Some((pm, pjob)) = pending_finish.take() {
+            self.moe_finish(&xs[pm], pjob);
         }
         if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo.take() {
             let tl = Instant::now();
@@ -1372,6 +1576,8 @@ impl Model {
         r: &Routed,
         pending_promo: &mut Option<(usize, usize, usize)>,
     ) -> Vec<u32> {
+        let read_client = self.gpu.client.clone();
+        let pack_fut = Gpu::read_u32_async(&read_client, &r.pack);
         let ready_promo = pending_promo.take().map(|(prev_li, prev_e, prev_slot)| {
             let tl = Instant::now();
             let packed = self.moes[prev_li].experts.repack_one(&self.gguf, prev_e);
@@ -1379,7 +1585,7 @@ impl Model {
             (prev_li, prev_e, prev_slot, packed)
         });
         let ts = Instant::now();
-        let pack_host = self.gpu.read_u32(&r.pack);
+        let pack_host = pack_fut.wait();
         self.stats.route_sync_secs += ts.elapsed().as_secs_f64();
         if let Some((prev_li, prev_e, prev_slot, packed)) = ready_promo {
             let tl = Instant::now();
@@ -1403,12 +1609,13 @@ impl Model {
         pending_promo: &mut Option<(usize, usize, usize)>,
     ) -> MoeJob {
         let pack_host = self.moe_sync(&r, pending_promo);
-        self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo)
+        self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo, None)
     }
 
     /// Multi-token hybrid MoE, first half: partition routed pairs into VRAM hits and
     /// misses, enqueue the shared expert + hit experts on the GPU, and pick a promotion.
     /// The misses are left for [`Self::moe_cpu`].
+    #[allow(clippy::too_many_arguments)]
     fn moe_begin_host(
         &mut self,
         li: usize,
@@ -1417,20 +1624,17 @@ impl Model {
         pack_host: &[u32],
         r: Routed,
         pending_promo: &mut Option<(usize, usize, usize)>,
+        prev_finish: Option<(&Buf, MoeJob, Option<Buf>)>,
     ) -> MoeJob {
         let c = &self.cfg;
-        let (ne, topk, inter, hidden) = (c.n_experts, c.topk, c.expert_inter, c.hidden);
+        let (topk, inter, hidden) = (c.topk, c.expert_inter, c.hidden);
         let gm = self.gemm_min_m;
         let npairs = t * topk;
         let ids_host = &pack_host[..npairs];
         let wts_host: &[f32] = bytemuck::cast_slice(&pack_host[npairs..2 * npairs]);
         let h2_host: &[f32] = bytemuck::cast_slice(&pack_host[2 * npairs..2 * npairs + t * hidden]);
 
-        let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); ne];
-        for (p, &e) in ids_host.iter().enumerate() {
-            by_expert[e as usize].push(p as u32);
-        }
-        let mut hit_desc = Vec::new();
+        let mut hit_desc = Vec::with_capacity(npairs * MOE_DESC);
         let mut max_cnt = 0usize;
         // Hit weights first; CPU-computed pairs get weight 0 (their sum arrives premixed).
         let mut pack = vec![0.0f32; npairs + t * hidden];
@@ -1438,46 +1642,60 @@ impl Model {
         let mut misses = Vec::new();
         {
             let st = &mut self.moes[li].experts;
-            for (e, pairs) in by_expert.iter().enumerate() {
-                if pairs.is_empty() {
-                    continue;
+            let mut sorted: Vec<(u32, u32)> = ids_host
+                .iter()
+                .enumerate()
+                .map(|(p, &e)| (e, p as u32))
+                .collect();
+            sorted.sort_unstable_by_key(|&(e, p)| (e, p));
+            let mut i = 0usize;
+            while i < sorted.len() {
+                let e = sorted[i].0 as usize;
+                let mut j = i + 1;
+                while j < sorted.len() && sorted[j].0 as usize == e {
+                    j += 1;
                 }
+                let cnt = j - i;
                 self.clock += 1;
-                st.freq[e] = st.freq[e].saturating_add(pairs.len() as u32);
+                st.freq[e] = st.freq[e].saturating_add(cnt as u32);
                 if st.slot_of[e] >= 0 {
                     let slot = st.slot_of[e] as usize;
                     st.stamp[slot] = self.clock;
-                    self.stats.expert_hits += pairs.len() as u64;
-                    for chunk in pairs.chunks(MOE_MAXM) {
+                    self.stats.expert_hits += cnt as u64;
+                    for chunk in sorted[i..j].chunks(MOE_MAXM) {
                         max_cnt = max_cnt.max(chunk.len());
                         hit_desc.push(slot as u32);
                         hit_desc.push(chunk.len() as u32);
-                        hit_desc.extend((0..MOE_MAXM).map(|i| chunk.get(i).copied().unwrap_or(0)));
+                        hit_desc.extend((0..MOE_MAXM).map(|k| chunk.get(k).map_or(0, |&(_, p)| p)));
                     }
                 } else {
-                    self.stats.expert_misses += pairs.len() as u64;
-                    let rows = pairs
+                    self.stats.expert_misses += cnt as u64;
+                    let rows = sorted[i..j]
                         .iter()
-                        .map(|&p| {
+                        .map(|&(_, p)| {
                             pack[p as usize] = 0.0;
                             ((p as usize) / topk, wts_host[p as usize])
                         })
                         .collect();
                     misses.push((e, rows));
                 }
+                i = j;
             }
         }
 
+        // Upload descriptors BEFORE launching any compute kernels so wgpu emits zero
+        // mid-pass queue.submit() flushes between host writes and compute dispatches.
+        let desc_buf = (!hit_desc.is_empty()).then(|| self.gpu.upload_u32(&hit_desc));
+        if let Some((px, pjob, pcpu)) = prev_finish {
+            self.moe_combine_job(px, &pjob, pcpu.as_ref());
+        }
         let w = &self.moes[li];
-        let g = self.gpu.linear(&w.gate_sh, h2, t, gm);
-        let u = self.gpu.linear(&w.up_sh, h2, t, gm);
-        let a = self.gpu.swiglu(&g, &u, t * c.shared_inter);
+        let a = self.gpu.linear_swiglu(&w.gate_sh, &w.up_sh, h2, t, gm);
         let sh = self.gpu.linear(&w.down_sh, &a, t, gm);
         let y = self.gpu.alloc(npairs * hidden);
-        if !hit_desc.is_empty() {
+        if let Some(desc_buf) = desc_buf {
             let act = self.gpu.alloc(npairs * inter);
             let ntiles = hit_desc.len() / MOE_DESC;
-            let desc_buf = self.gpu.upload_u32(&hit_desc);
             self.run_experts(li, &desc_buf, ntiles, max_cnt, h2, &act, &y);
         }
         if t <= 8 && !misses.is_empty() {
@@ -1529,24 +1747,28 @@ impl Model {
         );
     }
 
-    /// Multi-token hybrid MoE, last half: upload the CPU results and combine into `x`.
-    fn moe_finish(&self, x: &Buf, job: MoeJob) {
+    fn moe_combine_job(&self, x: &Buf, job: &MoeJob, cpu: Option<&Buf>) {
         let c = &self.cfg;
         let (ne, topk) = (c.n_experts, c.topk);
-        let cpu = (!job.misses.is_empty()).then(|| self.gpu.upload_f32(&job.pack));
         self.gpu.moe_combine(
             x,
             &job.y,
             &job.wts,
             &job.sh,
             &job.logits,
-            cpu.as_ref(),
+            cpu,
             job.t,
             c.hidden,
             topk,
             ne + 1,
             ne,
         );
+    }
+
+    /// Multi-token hybrid MoE, last half: upload the CPU results and combine into `x`.
+    fn moe_finish(&self, x: &Buf, job: MoeJob) {
+        let cpu = (!job.misses.is_empty()).then(|| self.gpu.upload_f32(&job.pack));
+        self.moe_combine_job(x, &job, cpu.as_ref());
     }
 
     fn moe(
@@ -1568,9 +1790,7 @@ impl Model {
             let w = &self.moes[li];
             let logits = gpu.linear(&w.router, h2, t, gm);
             let (ids, wts) = gpu.moe_route(&logits, t, ne, ne + 1, topk);
-            let g = gpu.linear(&w.gate_sh, h2, t, gm);
-            let u = gpu.linear(&w.up_sh, h2, t, gm);
-            let a = gpu.swiglu(&g, &u, t * c.shared_inter);
+            let a = gpu.linear_swiglu(&w.gate_sh, &w.up_sh, h2, t, gm);
             let sh = gpu.linear(&w.down_sh, &a, t, gm);
             let act = gpu.alloc(npairs * inter);
             let y = gpu.alloc(npairs * hidden);
@@ -1588,7 +1808,10 @@ impl Model {
             let r = self.moe_route_enqueue(li, h2, t);
             let pack_host = self.moe_sync(&r, pending_promo);
             if t > 1 {
-                let mut job = self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo);
+                let mut job = self.moe_begin_host(li, h2, t, &pack_host, r, pending_promo, None);
+                if !job.misses.is_empty() {
+                    self.gpu.flush();
+                }
                 let tc = Instant::now();
                 self.moe_cpu(&mut job);
                 self.stats.cpu_secs += tc.elapsed().as_secs_f64();
@@ -1637,22 +1860,23 @@ impl Model {
                 }
 
                 // 3. Immediately enqueue shared expert + hit experts on the GPU so they run
-                //    in parallel with CPU execution of the missed experts.
+                //    in parallel with CPU execution of the missed experts. Upload descriptors
+                //    first while the wgpu command encoder is empty (zero extra submit).
+                let desc_buf =
+                    (hit_tiles > 0).then(|| self.gpu.upload_u32(&hit_desc[..hit_tiles * MOE_DESC]));
                 let w = &self.moes[li];
-                let g = self.gpu.linear(&w.gate_sh, h2, 1, gm);
-                let u = self.gpu.linear(&w.up_sh, h2, 1, gm);
-                let a = self.gpu.swiglu(&g, &u, c.shared_inter);
+                let a = self.gpu.linear_swiglu(&w.gate_sh, &w.up_sh, h2, 1, gm);
                 let sh = self.gpu.linear(&w.down_sh, &a, 1, gm);
 
                 let y = self.gpu.alloc(npairs * hidden);
-                if hit_tiles > 0 {
+                if let Some(desc_buf) = desc_buf {
                     let act = self.gpu.alloc(npairs * inter);
-                    let desc_buf = self.gpu.upload_u32(&hit_desc[..hit_tiles * MOE_DESC]);
                     self.run_experts(li, &desc_buf, hit_tiles, 1, h2, &act, &y);
                 }
 
                 // 4. Compute missed experts on CPU while GPU runs shared + hit experts.
                 if n_miss > 0 {
+                    self.gpu.flush();
                     let st = &self.moes[li].experts;
                     let mut jobs_arr = [CpuDecodeJob {
                         gate_raw: &[],
@@ -1726,9 +1950,7 @@ impl Model {
         let logits = gpu.linear(&w.router, h2, t, gm);
         let (ids, wts) = gpu.moe_route(&logits, t, ne, ne + 1, topk);
         self.prof.tick(gpu, 2);
-        let g = gpu.linear(&w.gate_sh, h2, t, gm);
-        let u = gpu.linear(&w.up_sh, h2, t, gm);
-        let a = gpu.swiglu(&g, &u, t * c.shared_inter);
+        let a = gpu.linear_swiglu(&w.gate_sh, &w.up_sh, h2, t, gm);
         let sh = gpu.linear(&w.down_sh, &a, t, gm);
         self.prof.tick(gpu, 3);
         let act = gpu.alloc(npairs * inter);

@@ -7,7 +7,7 @@ edition = "2024"
 default = ["cuda", "wgpu"]
 cpu = ["burn-cubecl/cpu"]
 cuda = ["burn-cubecl/cuda"]
-wgpu = ["burn-cubecl/wgpu"]
+wgpu = ["burn-cubecl/wgpu", "burn-cubecl/vulkan"]
 
 [dependencies]
 burn-cubecl = { version = "0.23.0-pre.2", default-features = false, features = ["std", "autotune", "persistence"] }
@@ -33,6 +33,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+debug-assertions = false
 
 [profile.release]
 debug = "line-tables-only"

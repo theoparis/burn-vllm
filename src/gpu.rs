@@ -53,8 +53,20 @@ pub struct Gpu {
     pub client: Client,
     pub device: CubeDevice,
     pub plane: u32,
+    pub is_wgpu: bool,
     /// Placeholder for kernel arguments a comptime flag leaves unused.
     dummy: Buf,
+}
+
+/// In-flight device-to-host `u32` readback whose copy and queue submission have already been issued.
+pub struct PendingU32<'a> {
+    fut: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u32>> + Send + 'a>>,
+}
+
+impl PendingU32<'_> {
+    pub fn wait(self) -> Vec<u32> {
+        futures_lite::future::block_on(self.fut)
+    }
 }
 
 /// Split a 1-D cube count over (x, y) to respect per-dimension grid limits.
@@ -131,6 +143,7 @@ impl Gpu {
         let client = device.client();
         let hw = &client.properties().hardware;
         let plane = hw.plane_size_max.max(hw.plane_size_min).max(8);
+        let is_wgpu = client.name().starts_with("wgpu");
         let dummy = Buf {
             h: client.empty(4),
             len: 1,
@@ -139,6 +152,7 @@ impl Gpu {
             client,
             device,
             plane,
+            is_wgpu,
             dummy,
         }
     }
@@ -198,6 +212,27 @@ impl Gpu {
         bytemuck::cast_slice::<u8, u32>(&bytes[..b.len * 4]).to_vec()
     }
 
+    /// Issue a device-to-host `u32` readback (flushing queued compute + copy immediately)
+    /// without blocking until [`PendingU32::wait`] is called.
+    pub fn read_u32_async<'a>(client: &'a Client, b: &Buf) -> PendingU32<'a> {
+        let len = b.len;
+        let fut = client.read_async(vec![b.h.clone()]);
+        PendingU32 {
+            fut: Box::pin(async move {
+                let bytes = fut.await.expect("device read").remove(0);
+                bytemuck::cast_slice::<u8, u32>(&bytes[..len * 4]).to_vec()
+            }),
+        }
+    }
+
+    /// Submit queued GPU work to the hardware queue without waiting for completion.
+    /// Needed on wgpu (which batches launches in a command encoder) before CPU-overlapped phases.
+    pub fn flush(&self) {
+        if self.is_wgpu {
+            self.client.flush().expect("device flush");
+        }
+    }
+
     /// Threads per cube for the plane-per-row kernels and the rows each cube covers
     /// (computed with the largest plane size, so the grid never undercounts).
     fn rows_cube(&self) -> (u32, u32) {
@@ -208,7 +243,7 @@ impl Gpu {
     /// out[m, n] (+)= x[m, k] . W[n, k] for small m (decode-style, weight streamed once
     /// per `maxm` rows of x).
     pub fn qmatmul(&self, w: &QWeight, x: &Buf, m: usize, out: &Buf, accumulate: bool) {
-        assert!(x.len >= m * w.k && out.len >= m * w.n);
+        assert!(m > 0 && w.n > 0 && w.k > 0 && x.len >= m * w.k && out.len >= m * w.n);
         let maxm = if m >= 8 {
             8
         } else if m >= 4 {
@@ -219,42 +254,105 @@ impl Gpu {
             1
         };
         let (threads, rows) = self.rows_cube();
-        let rpp = if w.fmt == 1 && maxm >= 2 { 4usize } else { 1 };
+        let rpp = if w.fmt == 1 && maxm >= 2 && w.n >= 512 {
+            4usize
+        } else {
+            1usize
+        };
         let (gx, gy) = fold((w.n as u32).div_ceil(rows * rpp as u32));
         let gz = (m as u32).div_ceil(maxm as u32);
-        kernels::qmatmul::launch(
-            &self.client,
-            CubeCount::Static(gx, gy, gz),
-            CubeDim::new_1d(threads),
-            w.w0.arg(),
-            w.w0.argv(),
-            w.w1.arg(),
-            x.argv(),
-            out.arg(),
-            w.n as u32,
-            w.k as u32,
-            m as u32,
-            w.fmt,
-            maxm,
-            rpp,
-            accumulate,
-        );
+        unsafe {
+            kernels::qmatmul::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx, gy, gz),
+                CubeDim::new_1d(threads),
+                w.w0.arg(),
+                w.w0.argv(),
+                w.w1.arg(),
+                x.argv(),
+                out.arg(),
+                w.n as u32,
+                w.k as u32,
+                m as u32,
+                w.fmt,
+                maxm,
+                rpp,
+                accumulate,
+            );
+        }
+    }
+
+    /// Fused `silu(x @ gate^T) * (x @ up^T)` for small M; falls back to GEMM for large M.
+    pub fn linear_swiglu(
+        &self,
+        gate: &QWeight,
+        up: &QWeight,
+        x: &Buf,
+        m: usize,
+        gemm_min_m: usize,
+    ) -> Buf {
+        if Self::use_gemm(gate, m, gemm_min_m)
+            || gate.fmt != up.fmt
+            || gate.n != up.n
+            || gate.k != up.k
+        {
+            let g = self.linear(gate, x, m, gemm_min_m);
+            let u = self.linear(up, x, m, gemm_min_m);
+            return self.swiglu(&g, &u, m * gate.n);
+        }
+        assert!(m > 0 && gate.n > 0 && gate.k > 0 && x.len >= m * gate.k);
+        let maxm = if m >= 8 {
+            8
+        } else if m >= 4 {
+            4
+        } else if m >= 2 {
+            2
+        } else {
+            1
+        };
+        let (threads, rows) = self.rows_cube();
+        let (gx, gy) = fold((gate.n as u32).div_ceil(rows));
+        let gz = (m as u32).div_ceil(maxm as u32);
+        let out = self.alloc(m * gate.n);
+        unsafe {
+            kernels::qmatmul_swiglu::launch_unchecked(
+                &self.client,
+                CubeCount::Static(gx, gy, gz),
+                CubeDim::new_1d(threads),
+                gate.w0.arg(),
+                gate.w0.argv(),
+                gate.w1.arg(),
+                up.w0.arg(),
+                up.w0.argv(),
+                up.w1.arg(),
+                x.argv(),
+                out.arg(),
+                gate.n as u32,
+                gate.k as u32,
+                m as u32,
+                gate.fmt,
+                maxm,
+            );
+        }
+        out
     }
 
     /// Full f32 dequantization of a weight into a fresh [n, k] buffer.
     pub fn dequant(&self, w: &QWeight) -> Buf {
         let nb = w.n * w.k / 32;
         let out = self.alloc(w.n * w.k);
-        kernels::dequant::launch(
-            &self.client,
-            grid_1d(nb),
-            CubeDim::new_1d(WG),
-            w.w0.arg(),
-            w.w1.arg(),
-            out.arg(),
-            nb as u32,
-            w.fmt,
-        );
+        unsafe {
+            kernels::dequant::launch_unchecked(
+                &self.client,
+                grid_1d(nb),
+                CubeDim::new_1d(WG),
+                w.w0.arg(),
+                w.w1.arg(),
+                out.arg(),
+                nb as u32,
+                w.fmt,
+            );
+        }
         out
     }
 
@@ -316,97 +414,135 @@ impl Gpu {
 
     pub fn rmsnorm(&self, x: &Buf, w: &Buf, rows: usize, d: usize, eps: f32) -> Buf {
         let out = self.alloc(rows * d);
-        kernels::rmsnorm::launch(
-            &self.client,
-            CubeCount::Static(rows as u32, 1, 1),
-            CubeDim::new_1d(WG),
-            x.arg(),
-            w.arg(),
-            out.arg(),
-            d as u32,
-            eps,
-        );
+        unsafe {
+            kernels::rmsnorm::launch_unchecked(
+                &self.client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(WG),
+                x.arg(),
+                w.arg(),
+                out.arg(),
+                d as u32,
+                eps,
+            );
+        }
         out
     }
 
     pub fn add_inplace(&self, x: &Buf, y: &Buf, n: usize) {
-        kernels::add_inplace::launch(
-            &self.client,
-            grid_1d(n),
-            CubeDim::new_1d(WG),
-            x.arg(),
-            y.arg(),
-            n as u32,
-        );
+        unsafe {
+            kernels::add_inplace::launch_unchecked(
+                &self.client,
+                grid_1d(n),
+                CubeDim::new_1d(WG),
+                x.arg(),
+                y.arg(),
+                n as u32,
+            );
+        }
     }
 
     pub fn swiglu(&self, g: &Buf, u: &Buf, n: usize) -> Buf {
         let out = self.alloc(n);
-        kernels::swiglu::launch(
-            &self.client,
-            grid_1d(n),
-            CubeDim::new_1d(WG),
-            g.arg(),
-            u.arg(),
-            out.arg(),
-            n as u32,
-        );
+        unsafe {
+            kernels::swiglu::launch_unchecked(
+                &self.client,
+                grid_1d(n),
+                CubeDim::new_1d(WG),
+                g.arg(),
+                u.arg(),
+                out.arg(),
+                n as u32,
+            );
+        }
         out
     }
 
-    /// `snap`: rollback buffer for the state after each token but the last (see kernel).
+    /// `snap`: `(buf, snap_count)` rollback buffer receiving state after tokens `0..snap_count`.
     pub fn gdn_conv(
         &self,
         x: &Buf,
         w: &Buf,
         state: &Buf,
-        snap: Option<&Buf>,
+        snap: Option<(&Buf, usize)>,
         c: usize,
         t: usize,
     ) -> Buf {
+        self.gdn_conv_strided(x, w, state, snap, c, c, t)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_strided(
+        &self,
+        x: &Buf,
+        w: &Buf,
+        state: &Buf,
+        snap: Option<(&Buf, usize)>,
+        c: usize,
+        x_stride: usize,
+        t: usize,
+    ) -> Buf {
         let out = self.alloc(t * c);
-        kernels::gdn_conv::launch(
-            &self.client,
-            CubeCount::Static((c as u32).div_ceil(WG), 1, 1),
-            CubeDim::new_1d(WG),
-            x.arg(),
-            w.arg(),
-            state.arg(),
-            out.arg(),
-            snap.unwrap_or(&self.dummy).arg(),
-            c as u32,
-            t as u32,
-            snap.is_some(),
-        );
+        let (snap_buf, snap_count, save) = match snap {
+            Some((b, cnt)) if cnt > 0 => {
+                assert!(
+                    cnt <= t && b.len >= cnt * 3 * c,
+                    "gdn_conv snapshot overflow"
+                );
+                (b, cnt as u32, true)
+            }
+            _ => (&self.dummy, 0u32, false),
+        };
+        unsafe {
+            kernels::gdn_conv::launch_unchecked(
+                &self.client,
+                CubeCount::Static((c as u32).div_ceil(WG), 1, 1),
+                CubeDim::new_1d(WG),
+                x.arg(),
+                w.arg(),
+                state.arg(),
+                out.arg(),
+                snap_buf.arg(),
+                c as u32,
+                x_stride as u32,
+                t as u32,
+                snap_count,
+                save,
+            );
+        }
         out
     }
 
     /// dst[0..n] = src[src_off..src_off + n]
     pub fn copy_f32(&self, dst: &Buf, src: &Buf, src_off: usize, n: usize) {
-        kernels::copy_f32::launch(
-            &self.client,
-            grid_1d(n),
-            CubeDim::new_1d(WG),
-            dst.arg(),
-            src.arg(),
-            src_off as u32,
-            n as u32,
-        );
+        unsafe {
+            kernels::copy_f32::launch_unchecked(
+                &self.client,
+                grid_1d(n),
+                CubeDim::new_1d(WG),
+                dst.arg(),
+                src.arg(),
+                src_off as u32,
+                n as u32,
+            );
+        }
     }
 
     /// Rows [a | b] of width 2d from two [rows, d] buffers.
     pub fn concat_rows(&self, a: &Buf, b: &Buf, rows: usize, d: usize) -> Buf {
         let out = self.alloc(rows * 2 * d);
-        kernels::concat_rows::launch(
-            &self.client,
-            grid_1d(rows * 2 * d),
-            CubeDim::new_1d(WG),
-            a.arg(),
-            b.arg(),
-            out.arg(),
-            d as u32,
-            (rows * 2 * d) as u32,
-        );
+        unsafe {
+            kernels::concat_rows::launch_unchecked(
+                &self.client,
+                grid_1d(rows * 2 * d),
+                CubeDim::new_1d(WG),
+                a.arg(),
+                b.arg(),
+                out.arg(),
+                d as u32,
+                (rows * 2 * d) as u32,
+            );
+        }
         out
     }
 
@@ -421,7 +557,55 @@ impl Gpu {
         dt_bias: &Buf,
         norm_w: &Buf,
         state: &Buf,
-        snap: Option<&Buf>,
+        snap: Option<(&Buf, usize)>,
+        t: usize,
+        nk: usize,
+        nv: usize,
+        dk: usize,
+        eps: f32,
+    ) -> Buf {
+        self.gdn_recurrent_strided(
+            conv,
+            alpha,
+            nv,
+            0,
+            beta,
+            nv,
+            0,
+            z,
+            nv * dk,
+            0,
+            ssm_a,
+            dt_bias,
+            norm_w,
+            state,
+            snap,
+            t,
+            nk,
+            nv,
+            dk,
+            eps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_recurrent_strided(
+        &self,
+        conv: &Buf,
+        alpha: &Buf,
+        a_stride: usize,
+        a_off: usize,
+        beta: &Buf,
+        b_stride: usize,
+        b_off: usize,
+        z: &Buf,
+        z_stride: usize,
+        z_off: usize,
+        ssm_a: &Buf,
+        dt_bias: &Buf,
+        norm_w: &Buf,
+        state: &Buf,
+        snap: Option<(&Buf, usize)>,
         t: usize,
         nk: usize,
         nv: usize,
@@ -429,27 +613,46 @@ impl Gpu {
         eps: f32,
     ) -> Buf {
         let out = self.alloc(t * nv * dk);
-        kernels::gdn_recurrent::launch(
-            &self.client,
-            CubeCount::Static(nv as u32, 1, 1),
-            CubeDim::new_1d(dk as u32),
-            conv.arg(),
-            alpha.arg(),
-            beta.arg(),
-            z.arg(),
-            ssm_a.arg(),
-            dt_bias.arg(),
-            norm_w.arg(),
-            state.arg(),
-            out.arg(),
-            snap.unwrap_or(&self.dummy).arg(),
-            t as u32,
-            nk as u32,
-            nv as u32,
-            eps,
-            dk,
-            snap.is_some(),
-        );
+        let (snap_buf, snap_count, save) = match snap {
+            Some((b, cnt)) if cnt > 0 => {
+                assert!(
+                    cnt <= t && b.len >= cnt * nv * dk * dk,
+                    "gdn_recurrent snapshot overflow"
+                );
+                (b, cnt as u32, true)
+            }
+            _ => (&self.dummy, 0u32, false),
+        };
+        unsafe {
+            kernels::gdn_recurrent::launch_unchecked(
+                &self.client,
+                CubeCount::Static(nv as u32, 1, 1),
+                CubeDim::new_1d(dk as u32),
+                conv.arg(),
+                alpha.arg(),
+                beta.arg(),
+                z.arg(),
+                ssm_a.arg(),
+                dt_bias.arg(),
+                norm_w.arg(),
+                state.arg(),
+                out.arg(),
+                snap_buf.arg(),
+                t as u32,
+                nk as u32,
+                nv as u32,
+                a_stride as u32,
+                a_off as u32,
+                b_stride as u32,
+                b_off as u32,
+                z_stride as u32,
+                z_off as u32,
+                snap_count,
+                eps,
+                dk,
+                save,
+            );
+        }
         out
     }
 
@@ -473,26 +676,28 @@ impl Gpu {
         eps: f32,
     ) -> Buf {
         let q = self.alloc(t * nh * hd);
-        kernels::attn_prep::launch(
-            &self.client,
-            CubeCount::Static((nh + nkv) as u32, t as u32, 1),
-            CubeDim::new_1d(hd as u32),
-            qg.arg(),
-            k.arg(),
-            v.arg(),
-            q_norm.arg(),
-            k_norm.arg(),
-            q.arg(),
-            k_cache.arg(),
-            v_cache.arg(),
-            nh as u32,
-            nkv as u32,
-            pos0 as u32,
-            rope_dim as u32,
-            theta,
-            eps,
-            hd,
-        );
+        unsafe {
+            kernels::attn_prep::launch_unchecked(
+                &self.client,
+                CubeCount::Static((nh + nkv) as u32, t as u32, 1),
+                CubeDim::new_1d(hd as u32),
+                qg.arg(),
+                k.arg(),
+                v.arg(),
+                q_norm.arg(),
+                k_norm.arg(),
+                q.arg(),
+                k_cache.arg(),
+                v_cache.arg(),
+                nh as u32,
+                nkv as u32,
+                pos0 as u32,
+                rope_dim as u32,
+                theta,
+                eps,
+                hd,
+            );
+        }
         q
     }
 
@@ -518,60 +723,65 @@ impl Gpu {
         let nkeys = pos0 + t;
         let (nsplit, split_len) = match attention_split_plan(t, nkeys) {
             SplitPlan::Single => {
-                kernels::attention::launch(
-                    &self.client,
-                    CubeCount::Static(nh as u32, t as u32, 1),
-                    CubeDim::new_1d(hd as u32),
-                    q.arg(),
-                    qg.arg(),
-                    k_cache.argv(),
-                    v_cache.arg(),
-                    out.arg(),
-                    self.dummy.arg(),
-                    nh as u32,
-                    nkv as u32,
-                    pos0 as u32,
-                    nkeys as u32,
-                    scale,
-                    hd,
-                    false,
-                );
+                unsafe {
+                    kernels::attention::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(nh as u32, t as u32, 1),
+                        CubeDim::new_1d(hd as u32),
+                        q.arg(),
+                        qg.arg(),
+                        k_cache.argv(),
+                        v_cache.arg(),
+                        out.arg(),
+                        self.dummy.arg(),
+                        nh as u32,
+                        nkv as u32,
+                        pos0 as u32,
+                        nkeys as u32,
+                        scale,
+                        hd,
+                        false,
+                    );
+                }
                 return out;
             }
             SplitPlan::Split { nsplit, split_len } => (nsplit, split_len),
         };
         let parts = self.alloc(t * nh * nsplit * hd);
         let ml = self.alloc(t * nh * nsplit * 2);
-        kernels::attention::launch(
-            &self.client,
-            CubeCount::Static(nh as u32, t as u32, nsplit as u32),
-            CubeDim::new_1d(hd as u32),
-            q.arg(),
-            qg.arg(),
-            k_cache.argv(),
-            v_cache.arg(),
-            parts.arg(),
-            ml.arg(),
-            nh as u32,
-            nkv as u32,
-            pos0 as u32,
-            split_len as u32,
-            scale,
-            hd,
-            true,
-        );
-        kernels::attention_combine::launch(
-            &self.client,
-            CubeCount::Static(nh as u32, t as u32, 1),
-            CubeDim::new_1d(hd as u32),
-            parts.arg(),
-            ml.arg(),
-            qg.arg(),
-            out.arg(),
-            nh as u32,
-            nsplit as u32,
-            hd,
-        );
+        unsafe {
+            kernels::attention::launch_unchecked(
+                &self.client,
+                CubeCount::Static(nh as u32, t as u32, nsplit as u32),
+                CubeDim::new_1d(hd as u32),
+                q.arg(),
+                qg.arg(),
+                k_cache.argv(),
+                v_cache.arg(),
+                parts.arg(),
+                ml.arg(),
+                nh as u32,
+                nkv as u32,
+                pos0 as u32,
+                split_len as u32,
+                scale,
+                hd,
+                true,
+            );
+            kernels::attention_combine::launch_unchecked(
+                &self.client,
+                CubeCount::Static(nh as u32, t as u32, 1),
+                CubeDim::new_1d(hd as u32),
+                parts.arg(),
+                ml.arg(),
+                qg.arg(),
+                out.arg(),
+                nh as u32,
+                (nh * 2 * hd) as u32,
+                nsplit as u32,
+                hd,
+            );
+        }
         out
     }
 
@@ -596,29 +806,88 @@ impl Gpu {
         theta: f32,
         eps: f32,
     ) -> Buf {
-        let q = self.alloc(t * nh * hd);
-        kernels::attn_prep_paged::launch(
-            &self.client,
-            CubeCount::Static((nh + nkv) as u32, t as u32, 1),
-            CubeDim::new_1d(hd as u32),
-            qg.arg(),
-            k.arg(),
-            v.arg(),
-            q_norm.arg(),
-            k_norm.arg(),
-            q.arg(),
-            k_pool.arg(),
-            v_pool.arg(),
-            page_table.arg(),
-            nh as u32,
-            nkv as u32,
-            pos0 as u32,
-            page_size as u32,
-            rope_dim as u32,
+        self.attn_prep_paged_strided(
+            qg,
+            nh * 2 * hd,
+            k,
+            nkv * hd,
+            0,
+            v,
+            nkv * hd,
+            0,
+            q_norm,
+            k_norm,
+            k_pool,
+            v_pool,
+            page_table,
+            t,
+            nh,
+            nkv,
+            hd,
+            pos0,
+            page_size,
+            rope_dim,
             theta,
             eps,
-            hd,
-        );
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prep_paged_strided(
+        &self,
+        qg: &Buf,
+        qg_stride: usize,
+        k: &Buf,
+        k_stride: usize,
+        k_off: usize,
+        v: &Buf,
+        v_stride: usize,
+        v_off: usize,
+        q_norm: &Buf,
+        k_norm: &Buf,
+        k_pool: &Buf,
+        v_pool: &Buf,
+        page_table: &Buf,
+        t: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos0: usize,
+        page_size: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Buf {
+        let q = self.alloc(t * nh * hd);
+        unsafe {
+            kernels::attn_prep_paged::launch_unchecked(
+                &self.client,
+                CubeCount::Static((nh + nkv) as u32, t as u32, 1),
+                CubeDim::new_1d(hd as u32),
+                qg.arg(),
+                k.arg(),
+                v.arg(),
+                q_norm.arg(),
+                k_norm.arg(),
+                q.arg(),
+                k_pool.arg(),
+                v_pool.arg(),
+                page_table.arg(),
+                nh as u32,
+                nkv as u32,
+                qg_stride as u32,
+                k_stride as u32,
+                k_off as u32,
+                v_stride as u32,
+                v_off as u32,
+                pos0 as u32,
+                page_size as u32,
+                rope_dim as u32,
+                theta,
+                eps,
+                hd,
+            );
+        }
         q
     }
 
@@ -627,6 +896,38 @@ impl Gpu {
         &self,
         q: &Buf,
         qg: &Buf,
+        k_pool: &Buf,
+        v_pool: &Buf,
+        page_table: &Buf,
+        t: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos0: usize,
+        page_size: usize,
+    ) -> Buf {
+        self.attention_paged_strided(
+            q,
+            qg,
+            nh * 2 * hd,
+            k_pool,
+            v_pool,
+            page_table,
+            t,
+            nh,
+            nkv,
+            hd,
+            pos0,
+            page_size,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_strided(
+        &self,
+        q: &Buf,
+        qg: &Buf,
+        qg_stride: usize,
         k_pool: &Buf,
         v_pool: &Buf,
         page_table: &Buf,
@@ -646,64 +947,71 @@ impl Gpu {
         let nkeys = pos0 + t;
         let (nsplit, split_len) = match attention_paged_split_plan(t, nh, nkeys) {
             SplitPlan::Single => {
-                kernels::attention_paged::launch(
-                    &self.client,
-                    CubeCount::Static(nh as u32, t as u32, 1),
-                    CubeDim::new_1d(hd as u32),
-                    q.arg(),
-                    qg.arg(),
-                    k_pool.argv(),
-                    v_pool.arg(),
-                    page_table.arg(),
-                    out.arg(),
-                    self.dummy.arg(),
-                    nh as u32,
-                    nkv as u32,
-                    pos0 as u32,
-                    page_size as u32,
-                    nkeys as u32,
-                    scale,
-                    hd,
-                    false,
-                );
+                unsafe {
+                    kernels::attention_paged::launch_unchecked(
+                        &self.client,
+                        CubeCount::Static(nh as u32, t as u32, 1),
+                        CubeDim::new_1d(hd as u32),
+                        q.arg(),
+                        qg.arg(),
+                        k_pool.argv(),
+                        v_pool.arg(),
+                        page_table.arg(),
+                        out.arg(),
+                        self.dummy.arg(),
+                        nh as u32,
+                        nkv as u32,
+                        qg_stride as u32,
+                        pos0 as u32,
+                        page_size as u32,
+                        nkeys as u32,
+                        scale,
+                        hd,
+                        false,
+                    );
+                }
                 return out;
             }
             SplitPlan::Split { nsplit, split_len } => (nsplit, split_len),
         };
         let parts = self.alloc(t * nh * nsplit * hd);
         let ml = self.alloc(t * nh * nsplit * 2);
-        kernels::attention_paged::launch(
-            &self.client,
-            CubeCount::Static(nh as u32, t as u32, nsplit as u32),
-            CubeDim::new_1d(hd as u32),
-            q.arg(),
-            qg.arg(),
-            k_pool.argv(),
-            v_pool.arg(),
-            page_table.arg(),
-            parts.arg(),
-            ml.arg(),
-            nh as u32,
-            nkv as u32,
-            pos0 as u32,
-            page_size as u32,
-            split_len as u32,
-            scale,
-            hd,
-            true,
-        );
-        kernels::attention_combine::launch(
-            &self.client,
-            CubeCount::Static(nh as u32, t as u32, 1),
-            CubeDim::new_1d(hd as u32),
-            parts.arg(),
-            ml.arg(),
-            qg.arg(),
-            out.arg(),
-            nh as u32,
-            nsplit as u32,
-            hd,
-        );
+        unsafe {
+            kernels::attention_paged::launch_unchecked(
+                &self.client,
+                CubeCount::Static(nh as u32, t as u32, nsplit as u32),
+                CubeDim::new_1d(hd as u32),
+                q.arg(),
+                qg.arg(),
+                k_pool.argv(),
+                v_pool.arg(),
+                page_table.arg(),
+                parts.arg(),
+                ml.arg(),
+                nh as u32,
+                nkv as u32,
+                qg_stride as u32,
+                pos0 as u32,
+                page_size as u32,
+                split_len as u32,
+                scale,
+                hd,
+                true,
+            );
+            kernels::attention_combine::launch_unchecked(
+                &self.client,
+                CubeCount::Static(nh as u32, t as u32, 1),
+                CubeDim::new_1d(hd as u32),
+                parts.arg(),
+                ml.arg(),
+                qg.arg(),
+                out.arg(),
+                nh as u32,
+                qg_stride as u32,
+                nsplit as u32,
+                hd,
+            );
+        }
         out
     }
 
@@ -717,18 +1025,20 @@ impl Gpu {
     ) -> (Buf, Buf) {
         let ids = self.alloc(t * topk);
         let wts = self.alloc(t * topk);
-        kernels::moe_route::launch(
-            &self.client,
-            CubeCount::Static((t as u32).div_ceil(64), 1, 1),
-            CubeDim::new_1d(64),
-            logits.arg(),
-            ids.arg(),
-            wts.arg(),
-            t as u32,
-            ne as u32,
-            stride as u32,
-            topk,
-        );
+        unsafe {
+            kernels::moe_route::launch_unchecked(
+                &self.client,
+                CubeCount::Static((t as u32).div_ceil(64), 1, 1),
+                CubeDim::new_1d(64),
+                logits.arg(),
+                ids.arg(),
+                wts.arg(),
+                t as u32,
+                ne as u32,
+                stride as u32,
+                topk,
+            );
+        }
         (ids, wts)
     }
 
@@ -746,34 +1056,38 @@ impl Gpu {
         let ids = self.alloc(t * topk);
         let wts = self.alloc(t * topk);
         let pack = self.alloc(t * (2 * topk + hidden));
-        kernels::moe_route_pack::launch(
-            &self.client,
-            CubeCount::Static(t as u32, 1, 1),
-            CubeDim::new_1d(WG),
-            logits.arg(),
-            h2.arg(),
-            ids.arg(),
-            wts.arg(),
-            pack.arg(),
-            t as u32,
-            ne as u32,
-            stride as u32,
-            hidden as u32,
-            topk,
-        );
+        unsafe {
+            kernels::moe_route_pack::launch_unchecked(
+                &self.client,
+                CubeCount::Static(t as u32, 1, 1),
+                CubeDim::new_1d(WG),
+                logits.arg(),
+                h2.arg(),
+                ids.arg(),
+                wts.arg(),
+                pack.arg(),
+                t as u32,
+                ne as u32,
+                stride as u32,
+                hidden as u32,
+                topk,
+            );
+        }
         (ids, wts, pack)
     }
 
     pub fn moe_direct_desc(&self, ids: &Buf, npairs: usize) -> Buf {
         let desc = self.alloc(npairs * MOE_DESC);
-        kernels::moe_direct_desc::launch(
-            &self.client,
-            grid_1d(npairs),
-            CubeDim::new_1d(WG),
-            ids.arg(),
-            desc.arg(),
-            npairs as u32,
-        );
+        unsafe {
+            kernels::moe_direct_desc::launch_unchecked(
+                &self.client,
+                grid_1d(npairs),
+                CubeDim::new_1d(WG),
+                ids.arg(),
+                desc.arg(),
+                npairs as u32,
+            );
+        }
         desc
     }
 
@@ -793,25 +1107,27 @@ impl Gpu {
         max_cnt: usize,
     ) {
         let (threads, rows) = self.rows_cube();
-        kernels::moe_gate_up::launch(
-            &self.client,
-            CubeCount::Static((inter as u32).div_ceil(rows), ntiles as u32, 1),
-            CubeDim::new_1d(threads),
-            gate.0.arg(),
-            gate.0.argv(),
-            gate.1.arg(),
-            up.0.arg(),
-            up.0.argv(),
-            up.1.arg(),
-            x.argv(),
-            desc.arg(),
-            act.arg(),
-            inter as u32,
-            k as u32,
-            topk as u32,
-            fmt,
-            tile_width(max_cnt),
-        );
+        unsafe {
+            kernels::moe_gate_up::launch_unchecked(
+                &self.client,
+                CubeCount::Static((inter as u32).div_ceil(rows), ntiles as u32, 1),
+                CubeDim::new_1d(threads),
+                gate.0.arg(),
+                gate.0.argv(),
+                gate.1.arg(),
+                up.0.arg(),
+                up.0.argv(),
+                up.1.arg(),
+                x.argv(),
+                desc.arg(),
+                act.arg(),
+                inter as u32,
+                k as u32,
+                topk as u32,
+                fmt,
+                tile_width(max_cnt),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -828,21 +1144,23 @@ impl Gpu {
         max_cnt: usize,
     ) {
         let (threads, rows) = self.rows_cube();
-        kernels::moe_down::launch(
-            &self.client,
-            CubeCount::Static((hidden as u32).div_ceil(rows), ntiles as u32, 1),
-            CubeDim::new_1d(threads),
-            w.0.arg(),
-            w.0.argv(),
-            w.1.arg(),
-            act.argv(),
-            desc.arg(),
-            y.arg(),
-            hidden as u32,
-            inter as u32,
-            fmt,
-            tile_width(max_cnt),
-        );
+        unsafe {
+            kernels::moe_down::launch_unchecked(
+                &self.client,
+                CubeCount::Static((hidden as u32).div_ceil(rows), ntiles as u32, 1),
+                CubeDim::new_1d(threads),
+                w.0.arg(),
+                w.0.argv(),
+                w.1.arg(),
+                act.argv(),
+                desc.arg(),
+                y.arg(),
+                hidden as u32,
+                inter as u32,
+                fmt,
+                tile_width(max_cnt),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -866,24 +1184,26 @@ impl Gpu {
             Some(b) => (b, true),
             None => (shared, false),
         };
-        kernels::moe_combine::launch(
-            &self.client,
-            grid_1d(total),
-            CubeDim::new_1d(WG),
-            x.arg(),
-            y.arg(),
-            wts.arg(),
-            shared.arg(),
-            logits.arg(),
-            cpu_buf.arg(),
-            hidden as u32,
-            total as u32,
-            topk as u32,
-            stride as u32,
-            gate_col as u32,
-            npairs as u32,
-            has_cpu,
-        );
+        unsafe {
+            kernels::moe_combine::launch_unchecked(
+                &self.client,
+                grid_1d(total),
+                CubeDim::new_1d(WG),
+                x.arg(),
+                y.arg(),
+                wts.arg(),
+                shared.arg(),
+                logits.arg(),
+                cpu_buf.arg(),
+                hidden as u32,
+                total as u32,
+                topk as u32,
+                stride as u32,
+                gate_col as u32,
+                npairs as u32,
+                has_cpu,
+            );
+        }
     }
 
     /// Argmax along the last dimension for `[rows, n]` logits; returns `rows` token ids.
@@ -892,25 +1212,27 @@ impl Gpu {
         let part_v = self.alloc(rows * NSPLIT);
         let part_i = self.alloc(rows * NSPLIT);
         let out = self.alloc(rows);
-        kernels::argmax_stage1::launch(
-            &self.client,
-            CubeCount::Static(NSPLIT as u32, rows as u32, 1),
-            CubeDim::new_1d(WG),
-            logits.arg(),
-            part_v.arg(),
-            part_i.arg(),
-            n as u32,
-            NSPLIT,
-        );
-        kernels::argmax_stage2::launch(
-            &self.client,
-            CubeCount::Static(rows as u32, 1, 1),
-            CubeDim::new_1d(NSPLIT as u32),
-            part_v.arg(),
-            part_i.arg(),
-            out.arg(),
-            NSPLIT,
-        );
+        unsafe {
+            kernels::argmax_stage1::launch_unchecked(
+                &self.client,
+                CubeCount::Static(NSPLIT as u32, rows as u32, 1),
+                CubeDim::new_1d(WG),
+                logits.arg(),
+                part_v.arg(),
+                part_i.arg(),
+                n as u32,
+                NSPLIT,
+            );
+            kernels::argmax_stage2::launch_unchecked(
+                &self.client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(NSPLIT as u32),
+                part_v.arg(),
+                part_i.arg(),
+                out.arg(),
+                NSPLIT,
+            );
+        }
         self.read_u32(&out)
     }
     pub fn sync(&self) {

@@ -53,34 +53,11 @@ impl Model {
         let Mixer::Attn(w) = &self.layers[li].mixer else {
             unreachable!("MTP block is a full-attention layer")
         };
-        let gm = self.gemm_min_m;
         let h = self
             .gpu
             .rmsnorm(&x, &self.layers[li].attn_norm, rows, c.hidden, c.eps);
-        let qg = self.gpu.linear(&w.q, &h, rows, gm);
-        let k = self.gpu.linear(&w.k, &h, rows, gm);
-        let v = self.gpu.linear(&w.v, &h, rows, gm);
         let ai = self.attn_idx[li].expect("MTP attention layer index");
-        let (kp, vp) = (&self.kv_pool.k_pools[ai], &self.kv_pool.v_pools[ai]);
-        self.gpu.attn_prep_paged(
-            &qg,
-            &k,
-            &v,
-            &w.q_norm,
-            &w.k_norm,
-            kp,
-            vp,
-            &st.page_table_buf,
-            rows,
-            c.n_heads,
-            c.n_kv,
-            c.head_dim,
-            pos0,
-            KV_PAGE_SIZE,
-            c.rope_dim,
-            c.rope_theta,
-            c.eps,
-        );
+        let _ = self.attn_proj_prep(w, &h, rows, ai, pos0, st);
     }
 
     /// One MTP draft step at position `pos`: returns the draft token and the head-normed
@@ -96,33 +73,13 @@ impl Model {
             };
             let gpu = &self.gpu;
             let hh = gpu.rmsnorm(&x, &self.layers[li].attn_norm, 1, c.hidden, c.eps);
-            let qg = gpu.linear(&w.q, &hh, 1, gm);
-            let k = gpu.linear(&w.k, &hh, 1, gm);
-            let v = gpu.linear(&w.v, &hh, 1, gm);
             let ai = self.attn_idx[li].expect("MTP attention layer index");
             let (kp, vp) = (&self.kv_pool.k_pools[ai], &self.kv_pool.v_pools[ai]);
-            let q = gpu.attn_prep_paged(
-                &qg,
-                &k,
-                &v,
-                &w.q_norm,
-                &w.k_norm,
-                kp,
-                vp,
-                &st.page_table_buf,
-                1,
-                c.n_heads,
-                c.n_kv,
-                c.head_dim,
-                pos,
-                KV_PAGE_SIZE,
-                c.rope_dim,
-                c.rope_theta,
-                c.eps,
-            );
-            let o = gpu.attention_paged(
+            let (q, qg, qg_stride) = self.attn_proj_prep(w, &hh, 1, ai, pos, st);
+            let o = gpu.attention_paged_strided(
                 &q,
                 &qg,
+                qg_stride,
                 kp,
                 vp,
                 &st.page_table_buf,

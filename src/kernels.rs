@@ -391,15 +391,20 @@ fn dot16(vals: &Array<f32>, #[comptime] off: usize, xv: &[V4f], xo: usize) -> f3
 }
 
 /// Shared-memory table of the 16 E2M1 values (x2, matching ggml's kvalues_mxfp4), built
-/// by the first 16 units. Must be reached by every unit of the cube.
+/// by the first 16 units. Must be reached by every unit of the cube. Only allocates and
+/// synchronizes when `fmt == 2` (MXFP4).
 #[cube]
-fn mxfp4_lut() -> Shared<[f32]> {
-    let mut lut = Shared::<[f32]>::new_slice(16usize);
-    if UNIT_POS < 16 {
-        lut[UNIT_POS as usize] = mxfp4_val(UNIT_POS);
+fn mxfp4_lut(#[comptime] fmt: u32) -> Shared<[f32]> {
+    if comptime!(fmt == 2) {
+        let mut lut = Shared::<[f32]>::new_slice(16usize);
+        if UNIT_POS < 16 {
+            lut[UNIT_POS as usize] = mxfp4_val(UNIT_POS);
+        }
+        sync_cube();
+        lut
+    } else {
+        Shared::<[f32]>::new_slice(1usize)
     }
-    sync_cube();
-    lut
 }
 
 /// One plane computes lane-partial dot products of weight row `row` (global row index
@@ -426,7 +431,6 @@ fn row_dot(
     let lane = UNIT_POS_PLANE as usize;
     let nl = PLANE_DIM as usize;
     let kb = k / 32;
-    let mut vals = Array::<f32>::new(32usize);
     if comptime!(fmt == 0) {
         let units = k / 4;
         let base = row * units;
@@ -550,6 +554,7 @@ fn row_dot(
     } else {
         // K-quants: half a sub-block (16 values) per lane step, so the per-sub-block
         // scale decode is amortized over 16 weights.
+        let mut vals = Array::<f32>::new(16usize);
         let units = kb * 2;
         let base = row * kb;
         let mut u = lane;
@@ -617,7 +622,7 @@ fn row_dot_q8_rows(
     }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn qmatmul(
     w0: &[u32],
     w0v: &[V4u],
@@ -632,7 +637,7 @@ pub fn qmatmul(
     #[comptime] rpp: usize,
     #[comptime] accumulate: bool,
 ) {
-    let lut = mxfp4_lut();
+    let lut = mxfp4_lut(fmt);
     let rows_per_cube = (CUBE_DIM / PLANE_DIM) as usize;
     let row0 = (folded_cube() * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize) * rpp;
     let n = n as usize;
@@ -678,8 +683,112 @@ pub fn qmatmul(
     }
 }
 
+/// Fused gate + up projection + SwiGLU for small M:
+/// `out[m, n] = silu(x[m, :] . G[n, :]) * (x[m, :] . U[n, :])`.
+#[cube(launch_unchecked)]
+pub fn qmatmul_swiglu(
+    g0: &[u32],
+    g0v: &[V4u],
+    g1: &[u32],
+    u0: &[u32],
+    u0v: &[V4u],
+    u1: &[u32],
+    xv: &[V4f],
+    out: &mut [f32],
+    n: u32,
+    k: u32,
+    m: u32,
+    #[comptime] fmt: u32,
+    #[comptime] maxm: usize,
+) {
+    let lut = mxfp4_lut(fmt);
+    let rows_per_cube = (CUBE_DIM / PLANE_DIM) as usize;
+    let row = folded_cube() * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize;
+    let n = n as usize;
+    let k = k as usize;
+    let m0 = CUBE_POS_Z as usize * maxm;
+    let cnt = min(maxm, m as usize - m0);
+    let mut ga = Array::<f32>::new(maxm);
+    let mut ua = Array::<f32>::new(maxm);
+    let mut xrow = Array::<usize>::new(maxm);
+    #[unroll]
+    for mi in 0..maxm {
+        ga[mi] = 0.0;
+        ua[mi] = 0.0;
+        xrow[mi] = min(m0 + mi, m as usize - 1) * (k / 4);
+    }
+    if row < n {
+        if comptime!(fmt == 1) {
+            let lane = UNIT_POS_PLANE as usize;
+            let nl = PLANE_DIM as usize;
+            let vecs = (k / 32) * 2;
+            let base = row * vecs;
+            let mut u = lane;
+            while u < vecs {
+                let vi = base + u;
+                let b = vi / 2;
+                let shift = ((b % 2) * 16) as u32;
+                let dg = f16_to_f32((g1[b / 2] >> shift) & 0xFFFF);
+                let du = f16_to_f32((u1[b / 2] >> shift) & 0xFFFF);
+                let gwv = g0v[vi];
+                let uwv = u0v[vi];
+                let xo = u * 4;
+                let mut sg = Array::<f32>::new(maxm);
+                let mut su = Array::<f32>::new(maxm);
+                #[unroll]
+                for mi in 0..maxm {
+                    sg[mi] = 0.0;
+                    su[mi] = 0.0;
+                }
+                #[unroll]
+                for wi in 0..4usize {
+                    let gw = gwv.extract(wi);
+                    let uw = uwv.extract(wi);
+                    let mut xs = Array::<V4f>::new(maxm);
+                    #[unroll]
+                    for mi in 0..maxm {
+                        xs[mi] = xv[xrow[mi] + xo + wi];
+                    }
+                    #[unroll]
+                    for j in 0..4usize {
+                        let gwf = sext8((gw >> comptime!((j * 8) as u32)) & 0xFF);
+                        let uwf = sext8((uw >> comptime!((j * 8) as u32)) & 0xFF);
+                        #[unroll]
+                        for mi in 0..maxm {
+                            let xj = xs[mi].extract(j);
+                            sg[mi] += gwf * xj;
+                            su[mi] += uwf * xj;
+                        }
+                    }
+                }
+                #[unroll]
+                for mi in 0..maxm {
+                    ga[mi] += dg * sg[mi];
+                    ua[mi] += du * su[mi];
+                }
+                u += nl;
+            }
+        } else {
+            row_dot(
+                g0, g0v, g1, &lut, xv, row, k, &xrow, maxm, &mut ga, fmt, maxm,
+            );
+            row_dot(
+                u0, u0v, u1, &lut, xv, row, k, &xrow, maxm, &mut ua, fmt, maxm,
+            );
+        }
+    }
+    #[unroll]
+    for mi in 0..maxm {
+        let g = plane_sum(ga[mi]);
+        let u = plane_sum(ua[mi]);
+        if row < n && UNIT_POS_PLANE == 0 && mi < cnt {
+            out[(m0 + mi) * n + row] = silu(g) * u;
+        }
+    }
+}
+
 /// Dequantize a whole tensor to f32 (row-major [N, K]). One unit per 32-block.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn dequant(w0: &[u32], w1: &[u32], out: &mut [f32], nblocks: u32, #[comptime] fmt: u32) {
     let b = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if b < nblocks as usize {
@@ -697,7 +806,7 @@ pub fn dequant(w0: &[u32], w1: &[u32], out: &mut [f32], nblocks: u32, #[comptime
 // ---------------------------------------------------------------------------
 
 /// out[r, :] = x[r, :] * rsqrt(mean(x^2) + eps) * w   (one cube per row)
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn rmsnorm(x: &[f32], w: &[f32], out: &mut [f32], d: u32, eps: f32) {
     let mut smem = Shared::<[f32]>::new_slice(MAX_PLANES);
     let r = CUBE_POS_X as usize;
@@ -719,7 +828,7 @@ pub fn rmsnorm(x: &[f32], w: &[f32], out: &mut [f32], d: u32, eps: f32) {
     }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn add_inplace(x: &mut [f32], y: &[f32], n: u32) {
     let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if i < n as usize {
@@ -728,7 +837,7 @@ pub fn add_inplace(x: &mut [f32], y: &[f32], n: u32) {
 }
 
 /// out[t, j] = silu(gu[t, j]) * gu[t, inter + j] over a fused [T, 2*inter] input.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn swiglu(g: &[f32], u: &[f32], out: &mut [f32], n: u32) {
     let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if i < n as usize {
@@ -743,8 +852,8 @@ pub fn swiglu(g: &[f32], u: &[f32], out: &mut [f32], n: u32) {
 /// Causal depthwise conv1d (kernel 4) + SiLU with a rolling 3-step state.
 /// x: [T, C], w: [C, 4], state: [3, C] (oldest first), out: [T, C]. One unit per channel.
 /// With `save`, `snap[ti]` ([3, C] each) receives the state after token `ti` for every
-/// `ti < t - 1` (speculative-decoding rollback).
-#[cube(launch)]
+/// `ti < snap_count` (speculative-decoding rollback).
+#[cube(launch_unchecked)]
 pub fn gdn_conv(
     x: &[f32],
     w: &[f32],
@@ -752,11 +861,14 @@ pub fn gdn_conv(
     out: &mut [f32],
     snap: &mut [f32],
     c: u32,
+    x_stride: u32,
     t: u32,
+    snap_count: u32,
     #[comptime] save: bool,
 ) {
     let ch = ABSOLUTE_POS as usize;
     let c = c as usize;
+    let xs = x_stride as usize;
     if ch < c {
         let w0 = w[ch * 4];
         let w1 = w[ch * 4 + 1];
@@ -766,14 +878,14 @@ pub fn gdn_conv(
         let mut h1 = state[c + ch];
         let mut h2 = state[2 * c + ch];
         for ti in 0..t as usize {
-            let v = x[ti * c + ch];
+            let v = x[ti * xs + ch];
             let y = w0 * h0 + w1 * h1 + w2 * h2 + w3 * v;
             out[ti * c + ch] = silu(y);
             h0 = h1;
             h1 = h2;
             h2 = v;
             if comptime!(save) {
-                if ti + 1 < t as usize {
+                if ti < snap_count as usize {
                     snap[ti * 3 * c + ch] = h0;
                     snap[ti * 3 * c + c + ch] = h1;
                     snap[ti * 3 * c + 2 * c + ch] = h2;
@@ -787,7 +899,7 @@ pub fn gdn_conv(
 }
 
 /// dst[i] = src[src_off + i] for i < n.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn copy_f32(dst: &mut [f32], src: &[f32], src_off: u32, n: u32) {
     let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if i < n as usize {
@@ -796,7 +908,7 @@ pub fn copy_f32(dst: &mut [f32], src: &[f32], src_off: u32, n: u32) {
 }
 
 /// out[r, :] = [a[r, :], b[r, :]] over rows of width d (out rows are 2d wide).
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn concat_rows(a: &[f32], b: &[f32], out: &mut [f32], d: u32, total: u32) {
     let i = (ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X) as usize;
     if i < total as usize {
@@ -816,7 +928,7 @@ pub fn concat_rows(a: &[f32], b: &[f32], out: &mut [f32], d: u32, total: u32) {
 /// conv: [T, 2*NK*DK + NV*DV] (q | k | v after conv+silu), ab: [T, 2*NV] (alpha | beta
 /// projections), z: [T, NV*DV], state: [NV, DK, DV], out: [T, NV*DV].
 /// V-head `h` reads key head `h % NK` (GGUF tiled head order).
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn gdn_recurrent(
     conv: &[f32],
     alpha: &[f32],
@@ -831,6 +943,13 @@ pub fn gdn_recurrent(
     t: u32,
     nk: u32,
     nv: u32,
+    a_stride: u32,
+    a_off: u32,
+    b_stride: u32,
+    b_off: u32,
+    z_stride: u32,
+    z_off: u32,
+    snap_count: u32,
     eps: f32,
     #[comptime] dk: usize,
     #[comptime] save: bool,
@@ -842,6 +961,12 @@ pub fn gdn_recurrent(
     let j = UNIT_POS as usize;
     let nk = nk as usize;
     let nv = nv as usize;
+    let a_st = a_stride as usize;
+    let a_o = a_off as usize;
+    let b_st = b_stride as usize;
+    let b_o = b_off as usize;
+    let z_st = z_stride as usize;
+    let z_o = z_off as usize;
     let dv = dk;
     let kh = h % nk;
     let key_dim = nk * dk;
@@ -868,10 +993,10 @@ pub fn gdn_recurrent(
         ks[j] = kv / f32::sqrt(kn + 1e-6);
         sync_cube();
 
-        let av = alpha[ti * nv + h] + dt_h;
+        let av = alpha[ti * a_st + a_o + h] + dt_h;
         let sp = select(av > 20.0, av, f32::ln(1.0 + f32::exp(av)));
         let g = f32::exp(a_h * sp);
-        let bt = sigmoid(beta[ti * nv + h]);
+        let bt = sigmoid(beta[ti * b_st + b_o + h]);
         let vj = conv[row + 2 * key_dim + h * dv + j];
 
         let mut kvm = 0.0f32;
@@ -888,11 +1013,11 @@ pub fn gdn_recurrent(
             o += s[i] * qs[i];
         }
         let on = cube_sum(o * o, &mut smem);
-        let zj = z[ti * nv * dv + h * dv + j];
+        let zj = z[ti * z_st + z_o + h * dv + j];
         out[ti * nv * dv + h * dv + j] =
             o / f32::sqrt(on / f32::cast_from(dv) + eps) * wj * silu(zj);
         if comptime!(save) {
-            if ti + 1 < t as usize {
+            if ti < snap_count as usize {
                 #[unroll]
                 for i in 0..dk {
                     snap[ti * nv * dk * dv + sbase + i * dv + j] = s[i];
@@ -913,7 +1038,7 @@ pub fn gdn_recurrent(
 /// Per-head RMSNorm + RoPE for q and k, scatter k/v into the cache.
 /// qg: [T, NH, 2*HD] (q | gate per head), k/v: [T, NKV, HD],
 /// q_out: [T, NH, HD], caches: [max_ctx, NKV, HD]. grid: (NH + NKV, T), cube: HD units.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn attn_prep(
     qg: &[f32],
     k: &[f32],
@@ -981,7 +1106,7 @@ pub fn attn_prep(
 /// token's causal range. With `partial`, it writes the unnormalized accumulator to
 /// `out[(t, h, split), :]` and `(max, sum)` to `ml` for [`attention_combine`]; otherwise
 /// (one split) it writes the gated, normalized output.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn attention(
     q: &[f32],
     qg: &[f32],
@@ -1072,13 +1197,14 @@ pub fn attention(
 }
 
 /// Merge split-K attention partials and apply the output gate. grid: (NH, T), cube: HD.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn attention_combine(
     parts: &[f32],
     ml: &[f32],
     qg: &[f32],
     out: &mut [f32],
     nh: u32,
+    qg_stride: u32,
     nsplit: u32,
     #[comptime] hd: usize,
 ) {
@@ -1099,13 +1225,13 @@ pub fn attention_combine(
         l += ml[(r0 + s) * 2 + 1] * w;
         acc += parts[(r0 + s) * hd + d] * w;
     }
-    let gate = qg[(t * nh + h) * 2 * hd + hd + d];
+    let gate = qg[t * qg_stride as usize + h * 2 * hd + hd + d];
     out[(t * nh + h) * hd + d] = acc / l * sigmoid(gate);
 }
 
 /// Paged FP16-packed variant of [`attn_prep`]: scatters K and V into physical pages
 /// (`[num_pages, page_size, NKV, HD/2]` u32, 2x f16 per word) via `page_table`.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn attn_prep_paged(
     qg: &[f32],
     k: &[f32],
@@ -1118,6 +1244,11 @@ pub fn attn_prep_paged(
     page_table: &[u32],
     nh: u32,
     nkv: u32,
+    qg_stride: u32,
+    k_stride: u32,
+    k_off: u32,
+    v_stride: u32,
+    v_off: u32,
     pos0: u32,
     page_size: u32,
     rope_dim: u32,
@@ -1134,9 +1265,9 @@ pub fn attn_prep_paged(
     let nkv = nkv as usize;
     let is_q = head < nh;
     let x = if is_q {
-        qg[(t * nh + head) * 2 * hd + d]
+        qg[t * qg_stride as usize + head * 2 * hd + d]
     } else {
-        k[(t * nkv + head - nh) * hd + d]
+        k[t * k_stride as usize + k_off as usize + (head - nh) * hd + d]
     };
     let wn = if is_q { q_norm[d] } else { k_norm[d] };
     let ss = cube_sum(x * x, &mut smem);
@@ -1167,7 +1298,7 @@ pub fn attn_prep_paged(
         let page_sz = page_size as usize;
         let page = page_table[p / page_sz] as usize;
         let off = p % page_sz;
-        let vv = v[(t * nkv + kvh) * hd + d];
+        let vv = v[t * v_stride as usize + v_off as usize + kvh * hd + d];
         let y_pair = plane_shuffle_xor(y, 1);
         let v_pair = plane_shuffle_xor(vv, 1);
         if d % 2 == 0 {
@@ -1180,7 +1311,7 @@ pub fn attn_prep_paged(
 
 /// Paged FP16-packed causal attention over `k_pool` / `v_pool` via `page_table`.
 /// HD must be 256 (32 keys x 8 lanes per tile).
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn attention_paged(
     q: &[f32],
     qg: &[f32],
@@ -1191,6 +1322,7 @@ pub fn attention_paged(
     ml: &mut [f32],
     nh: u32,
     nkv: u32,
+    qg_stride: u32,
     pos0: u32,
     page_size: u32,
     split_len: u32,
@@ -1285,7 +1417,7 @@ pub fn attention_paged(
             ml[r * 2 + 1] = l;
         }
     } else {
-        let gate = qg[(t * nh + h) * 2 * hd + hd + d];
+        let gate = qg[t * qg_stride as usize + h * 2 * hd + hd + d];
         out[(t * nh + h) * hd + d] = acc / l * sigmoid(gate);
     }
 }
@@ -1297,7 +1429,7 @@ pub fn attention_paged(
 /// Top-k routing on softmax(logits): weights renormalized over the selected experts
 /// (= softmax over the top-k logits). One unit per token.
 /// logits: [T, stride] (first `ne` columns are the router), ids/wts: [T, topk].
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_route(
     logits: &[f32],
     ids: &mut [u32],
@@ -1357,7 +1489,7 @@ pub fn moe_route(
 /// read all three in a single device-to-host sync.
 /// grid: (T, 1, 1), cube: 256.
 /// pack layout: `[ids: T*topk | wts_bits: T*topk | h2_bits: T*hidden]`.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_route_pack(
     logits: &[f32],
     h2: &[u32],
@@ -1434,7 +1566,7 @@ pub fn moe_route_pack(
 }
 
 /// Device-side descriptors for one (token, k) pair per tile with slot = expert id.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_direct_desc(ids: &[u32], desc: &mut [u32], npairs: u32) {
     let p = ABSOLUTE_POS as usize;
     if p < npairs as usize {
@@ -1467,7 +1599,7 @@ fn tile_rows(
 /// Routed gate/up projections + SwiGLU, one plane per intermediate row. Tiles hold up
 /// to `maxm` pairs (1 for decode). grid: (ceil(inter / rows_per_cube), tiles);
 /// x row = pair / topk; act: [pairs, inter].
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_gate_up(
     g0: &[u32],
     g0v: &[V4u],
@@ -1484,7 +1616,7 @@ pub fn moe_gate_up(
     #[comptime] fmt: u32,
     #[comptime] maxm: usize,
 ) {
-    let lut = mxfp4_lut();
+    let lut = mxfp4_lut(fmt);
     let rows_per_cube = (CUBE_DIM / PLANE_DIM) as usize;
     let row = CUBE_POS_X as usize * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize;
     let tile = CUBE_POS_Y as usize;
@@ -1574,7 +1706,7 @@ pub fn moe_gate_up(
 
 /// Routed down projection, one plane per hidden row.
 /// grid: (ceil(hidden / rows_per_cube), tiles); y: [pairs, hidden].
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_down(
     w0: &[u32],
     w0v: &[V4u],
@@ -1587,7 +1719,7 @@ pub fn moe_down(
     #[comptime] fmt: u32,
     #[comptime] maxm: usize,
 ) {
-    let lut = mxfp4_lut();
+    let lut = mxfp4_lut(fmt);
     let rows_per_cube = (CUBE_DIM / PLANE_DIM) as usize;
     let row = CUBE_POS_X as usize * rows_per_cube + (UNIT_POS / PLANE_DIM) as usize;
     let tile = CUBE_POS_Y as usize;
@@ -1631,7 +1763,7 @@ pub fn moe_down(
 /// x[t, d] += (y_cpu[t, d] if has_cpu) + sum_k wts[t, k] * y[t*topk + k, d]
 ///          + sigmoid(logits[t, gate_col]) * shared[t, d]
 /// When `has_cpu`, `cpu_pack` holds `[hit_wts: T*topk | y_cpu: T*hidden]` in one buffer.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn moe_combine(
     x: &mut [f32],
     y: &[f32],
@@ -1681,7 +1813,7 @@ pub fn moe_combine(
 // Argmax over [rows, n]
 // ---------------------------------------------------------------------------
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn argmax_stage1(
     x: &[f32],
     part_v: &mut [f32],
@@ -1731,7 +1863,7 @@ pub fn argmax_stage1(
     }
 }
 
-#[cube(launch)]
+#[cube(launch_unchecked)]
 pub fn argmax_stage2(part_v: &[f32], part_i: &[u32], out: &mut [u32], #[comptime] nsplit: usize) {
     let mut sv = Shared::<[f32]>::new_slice(nsplit);
     let mut si = Shared::<[u32]>::new_slice(nsplit);
