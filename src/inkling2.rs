@@ -195,9 +195,7 @@ impl Config {
 }
 
 fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let sum: f32 = x.iter().map(|v| v * v).sum();
-    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
-    x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
+    crate::vec::backend().rms_norm(x, w, eps)
 }
 
 /// Clip each row (head) of `x` to L2 norm <= threshold, after optional per-channel scale.
