@@ -48,7 +48,7 @@ fn silu(x: f32) -> f32 {
 }
 
 #[inline(always)]
-fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
@@ -190,11 +190,79 @@ pub(crate) fn neon_available() -> bool {
     neon::dotprod_available()
 }
 
+/// NEON activation quantization: exact scalar block sum (kept in order for parity), SIMD
+/// amax/round/pack. `vcvtaq_s32_f32` rounds ties away from zero like `f32::round`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn neon_quantize_into(x: &[f32], qs: &mut [i8], d: &mut [f32], bsum: &mut [f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let nb = x.len() / 32;
+        let clamp_lo = vdupq_n_s32(-127);
+        for bi in 0..nb {
+            let p = x.as_ptr().add(bi * 32);
+            // Keep the scalar summation order: bsum feeds the K-quant min correction.
+            let mut sum = 0.0f32;
+            for &v in &x[bi * 32..(bi + 1) * 32] {
+                sum += v;
+            }
+            bsum[bi] = sum;
+
+            let v0 = vabsq_f32(vld1q_f32(p));
+            let v1 = vabsq_f32(vld1q_f32(p.add(4)));
+            let v2 = vabsq_f32(vld1q_f32(p.add(8)));
+            let v3 = vabsq_f32(vld1q_f32(p.add(12)));
+            let v4 = vabsq_f32(vld1q_f32(p.add(16)));
+            let v5 = vabsq_f32(vld1q_f32(p.add(20)));
+            let v6 = vabsq_f32(vld1q_f32(p.add(24)));
+            let v7 = vabsq_f32(vld1q_f32(p.add(28)));
+            let amax = vmaxvq_f32(vmaxq_f32(
+                vmaxq_f32(vmaxq_f32(v0, v1), vmaxq_f32(v2, v3)),
+                vmaxq_f32(vmaxq_f32(v4, v5), vmaxq_f32(v6, v7)),
+            ));
+            let scale = amax / 127.0;
+            d[bi] = scale;
+            let inv = vdupq_n_f32(if scale > 0.0 { 1.0 / scale } else { 0.0 });
+
+            let i0 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p), inv));
+            let i1 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(4)), inv));
+            let i2 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(8)), inv));
+            let i3 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(12)), inv));
+            let i4 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(16)), inv));
+            let i5 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(20)), inv));
+            let i6 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(24)), inv));
+            let i7 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(28)), inv));
+            let pack4 = |a: int32x4_t, b: int32x4_t| {
+                vqmovn_s16(vcombine_s16(
+                    vqmovn_s32(vmaxq_s32(a, clamp_lo)),
+                    vqmovn_s32(vmaxq_s32(b, clamp_lo)),
+                ))
+            };
+            let bytes0 = vcombine_s8(pack4(i0, i1), pack4(i2, i3));
+            let bytes1 = vcombine_s8(pack4(i4, i5), pack4(i6, i7));
+            let dst = qs.as_mut_ptr().add(bi * 32);
+            vst1q_s8(dst, bytes0);
+            vst1q_s8(dst.add(16), bytes1);
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
     match ty {
+        GgmlType::Mxfp4 => neon::dot_mxfp4_q8(src, qx),
+        GgmlType::Q5K => neon::dot_q5k_q8(src, qx),
         GgmlType::Q6K => neon::dot_q6k_q8(src, qx),
         GgmlType::Q4K => neon::dot_q4k_q8(src, qx),
+        GgmlType::Q3K => neon::dot_q3k_q8(src, qx),
+        GgmlType::Q8_0 => neon::dot_q8_0_q8(src, qx),
+        GgmlType::Q5_1 => neon::dot_q5_1_q8(src, qx),
+        GgmlType::Iq4Nl => neon::dot_iq4nl_q8(src, qx),
+        GgmlType::Iq3S => neon::dot_iq3s_q8(src, qx),
+        GgmlType::Iq2S => neon::dot_iq2s_q8(src, qx),
+        GgmlType::Iq2Xxs => neon::dot_iq2xxs_q8(src, qx),
+        GgmlType::Iq2Xs => neon::dot_iq2xs_q8(src, qx),
+        GgmlType::Iq3Xxs => neon::dot_iq3xxs_q8(src, qx),
+        GgmlType::Nvfp4 => neon::dot_nvfp4_q8(src, qx),
         _ => None,
     }
 }
@@ -1470,6 +1538,605 @@ mod neon {
         Some(unsafe { dot_q4k_q8_dotprod(src, qx) })
     }
 
+    /// MXFP4 superblocks (17-byte blocks: E8M0 scale + 16 packed nibbles).
+    pub fn dot_mxfp4_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_mxfp4_q8_dotprod(src, qx) })
+    }
+
+    /// Q5_K superblocks (176-byte blocks).
+    pub fn dot_q5k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q5k_q8_dotprod(src, qx) })
+    }
+
+    /// Q8_0 blocks (34 bytes: f16 scale + 32 i8 weights).
+    pub fn dot_q8_0_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q8_0_q8_dotprod(src, qx) })
+    }
+
+    /// IQ2_S superblocks (82 bytes): 1024-entry u64 grids + USDOT.
+    pub fn dot_iq2s_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq2s_q8_dotprod(src, qx) })
+    }
+
+    /// IQ2_XXS superblocks (66 bytes): 256-entry u64 grids + USDOT.
+    pub fn dot_iq2xxs_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq2xxs_q8_dotprod(src, qx) })
+    }
+
+    /// IQ2_XS superblocks (74 bytes): 512-entry u64 grids + USDOT.
+    pub fn dot_iq2xs_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq2xs_q8_dotprod(src, qx) })
+    }
+
+    /// IQ3_S superblocks (110 bytes): 512-entry grid expansion + USDOT.
+    pub fn dot_iq3s_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq3s_q8_dotprod(src, qx) })
+    }
+
+    /// IQ3_XXS superblocks (98 bytes): 256-entry grid expansion + USDOT.
+    pub fn dot_iq3xxs_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq3xxs_q8_dotprod(src, qx) })
+    }
+
+    /// IQ4_NL blocks (18 bytes: f16 d + 16 packed nibbles from a 16-entry table).
+    pub fn dot_iq4nl_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_iq4nl_q8_dotprod(src, qx) })
+    }
+
+    /// NVFP4 blocks (36 bytes: four E4M3 scales + four 8-byte nibble groups).
+    pub fn dot_nvfp4_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_nvfp4_q8_dotprod(src, qx) })
+    }
+
+    /// Q5_1 blocks (24 bytes: f16 d/m, 4 high-bit bytes, 16 packed low nibbles).
+    pub fn dot_q5_1_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q5_1_q8_dotprod(src, qx) })
+    }
+
+    /// Q3_K superblocks (110 bytes).
+    pub fn dot_q3k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q3k_q8_dotprod(src, qx) })
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_mxfp4_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 17);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            // The 16-entry table covers both signs: indices 0..7 are positive, 8..15 negative.
+            let table = vld1q_s8(MXFP4_VALUES.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for b in 0..nb {
+                let p = src.as_ptr().add(b * 17);
+                let d = E8M0_LUT[*p as usize] * *dp.add(b);
+                let packed = vld1q_u8(p.add(1));
+                let w0 = vqtbl1q_s8(table, vandq_u8(packed, lo4));
+                let w1 = vqtbl1q_s8(table, vshrq_n_u8(packed, 4));
+                let dot0 = vaddvq_s32(vdotq_s32(zero, w0, vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(zero, w1, vld1q_s8(qp.add(16))));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    /// Signed dot of 8 expanded i8 grid values against 8 activations.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_grid8(w: &[i8; 8], qp: *const i8, zero: int32x2_t) -> f32 {
+        unsafe { vaddv_s32(vdot_s32(zero, vld1_s8(w.as_ptr()), vld1_s8(qp))) as f32 }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq2s_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        use crate::iq_grids::IQ2S_GRID;
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 82);
+            let zero = vdup_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 82);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                for s in 0..8usize {
+                    for l in 0..4usize {
+                        let idx = *b.add(2 + 4 * s + l) as usize
+                            | (((*b.add(66 + s) as usize) << (8 - 2 * l)) & 0x300);
+                        let grid = IQ2S_GRID[idx].to_le_bytes();
+                        let sg = *b.add(34 + 4 * s + l);
+                        let mut w = [0i8; 8];
+                        for j in 0..8 {
+                            w[j] = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                -1
+                            } else {
+                                1
+                            });
+                        }
+                        let base = d
+                            * (0.5
+                                + if l % 2 == 0 {
+                                    (*b.add(74 + s) & 0xF) as f32
+                                } else {
+                                    (*b.add(74 + s) >> 4) as f32
+                                })
+                            * 0.25
+                            * *dp.add(sb * 8 + s);
+                        sum += base * dot_grid8(&w, qp.add(8 * l), zero);
+                    }
+                    qp = qp.add(32);
+                }
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq2xxs_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        use crate::iq_grids::IQ2XXS_GRID;
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 66);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 66);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                for ib in 0..8usize {
+                    let q = b.add(2 + 8 * ib);
+                    let aux1 = u32::from_le_bytes([*q.add(4), *q.add(5), *q.add(6), *q.add(7)]);
+                    let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25 * *dp.add(sb * 8 + ib);
+                    let mut w = [0i8; 32];
+                    for l in 0..4usize {
+                        let grid = IQ2XXS_GRID[*q.add(l) as usize].to_le_bytes();
+                        let sg = crate::quant::ksign(((aux1 >> (7 * l)) & 127) as usize);
+                        for j in 0..8 {
+                            w[8 * l + j] = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                -1
+                            } else {
+                                1
+                            });
+                        }
+                    }
+                    sum += db * dot_grid32(&w, qp, zero);
+                    qp = qp.add(32);
+                }
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq2xs_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        use crate::iq_grids::IQ2XS_GRID;
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 74);
+            let zero = vdup_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 74);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                for ib in 0..8usize {
+                    for l in 0..4usize {
+                        let k = 4 * ib + l;
+                        let q = u16::from_le_bytes([*b.add(2 + 2 * k), *b.add(2 + 2 * k + 1)]);
+                        let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+                        let sg = crate::quant::ksign((q >> 9) as usize);
+                        let mut w = [0i8; 8];
+                        for j in 0..8 {
+                            w[j] = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                -1
+                            } else {
+                                1
+                            });
+                        }
+                        let sc = *b.add(66 + ib);
+                        let base = d
+                            * (0.5
+                                + if l % 2 == 0 {
+                                    (sc & 0xF) as f32
+                                } else {
+                                    (sc >> 4) as f32
+                                })
+                            * 0.25
+                            * *dp.add(sb * 8 + ib);
+                        sum += base * dot_grid8(&w, qp.add(8 * l), zero);
+                    }
+                    qp = qp.add(32);
+                }
+            }
+            sum
+        }
+    }
+
+    /// Signed dot of a 32-value expanded i8 grid against one activation block.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_grid32(w: &[i8; 32], qp: *const i8, zero: int32x4_t) -> f32 {
+        unsafe {
+            let x0 = vld1q_s8(qp);
+            let x1 = vld1q_s8(qp.add(16));
+            let d0 = vaddvq_s32(vdotq_s32(zero, vld1q_s8(w.as_ptr()), x0));
+            let d1 = vaddvq_s32(vdotq_s32(zero, vld1q_s8(w.as_ptr().add(16)), x1));
+            (d0 + d1) as f32
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq3s_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        use crate::iq_grids::IQ3S_GRID;
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 110);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 110);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                for s in 0..8usize {
+                    let qs = b.add(2 + 8 * s);
+                    let qh = *b.add(66 + s) as u32;
+                    let signs = b.add(74 + 4 * s);
+                    let mut w = [0i8; 32];
+                    for l in 0..4usize {
+                        let i1 = *qs.add(2 * l) as usize | ((qh << (8 - 2 * l)) & 256) as usize;
+                        let i2 = *qs.add(2 * l + 1) as usize | ((qh << (7 - 2 * l)) & 256) as usize;
+                        let g1 = IQ3S_GRID[i1].to_le_bytes();
+                        let g2 = IQ3S_GRID[i2].to_le_bytes();
+                        let sg = SIGN_LUT[*signs.add(l) as usize].to_le_bytes();
+                        for j in 0..4 {
+                            w[8 * l + j] = (g1[j] as i8).wrapping_mul(sg[j] as i8);
+                            w[8 * l + 4 + j] = (g2[j] as i8).wrapping_mul(sg[j + 4] as i8);
+                        }
+                    }
+                    let sc = 1.0 + 2.0 * ((*b.add(106 + s / 2) >> (4 * (s % 2))) & 0xF) as f32;
+                    sum += d * sc * *dp.add(sb * 8 + s) * dot_grid32(&w, qp, zero);
+                    qp = qp.add(32);
+                }
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq3xxs_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        use crate::iq_grids::IQ3XXS_GRID;
+        unsafe {
+            let nsb = qx.d.len() / 8;
+            debug_assert!(src.len() >= nsb * 98);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 98);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                for s in 0..8usize {
+                    let qs = b.add(2 + 8 * s);
+                    let aux = u32::from_le_bytes([
+                        *b.add(66 + 4 * s),
+                        *b.add(67 + 4 * s),
+                        *b.add(68 + 4 * s),
+                        *b.add(69 + 4 * s),
+                    ]);
+                    let mut w = [0i8; 32];
+                    for l in 0..4usize {
+                        let g1 = IQ3XXS_GRID[*qs.add(2 * l) as usize].to_le_bytes();
+                        let g2 = IQ3XXS_GRID[*qs.add(2 * l + 1) as usize].to_le_bytes();
+                        let sg = SIGN_LUT
+                            [crate::quant::ksign(((aux >> (7 * l)) & 127) as usize) as usize]
+                            .to_le_bytes();
+                        for j in 0..4 {
+                            w[8 * l + j] = (g1[j] as i8).wrapping_mul(sg[j] as i8);
+                            w[8 * l + 4 + j] = (g2[j] as i8).wrapping_mul(sg[j + 4] as i8);
+                        }
+                    }
+                    let scale = d * (0.5 + (aux >> 28) as f32) * 0.5 * *dp.add(sb * 8 + s);
+                    sum += scale * dot_grid32(&w, qp, zero);
+                    qp = qp.add(32);
+                }
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_iq4nl_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 18);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            let table = vld1q_s8(crate::quant::KVALUES_IQ4NL.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 18);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(bi);
+                let raw = vld1q_u8(p.add(2));
+                let w0 = vqtbl1q_s8(table, vandq_u8(raw, lo4));
+                let w1 = vqtbl1q_s8(table, vshrq_n_u8(raw, 4));
+                let dot0 = vaddvq_s32(vdotq_s32(zero, w0, vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(zero, w1, vld1q_s8(qp.add(16))));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_nvfp4_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 64;
+            debug_assert!(src.len() >= nb * 36);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            let table = vld1q_s8(MXFP4_VALUES.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 36);
+                for s in 0..4usize {
+                    let d = crate::quant::ue4m3_half(*p.add(s)) * *dp.add(bi * 2 + s / 2);
+                    // A sub-block is only 8 packed bytes: low nibbles give values 0..8,
+                    // high nibbles give 8..16. Interleave them into one 16-byte index vector.
+                    let raw8 = vld1_u8(p.add(4 + 8 * s));
+                    let raw = vcombine_u8(raw8, raw8);
+                    let idx = vcombine_u8(
+                        vget_low_u8(vandq_u8(raw, lo4)),
+                        vget_low_u8(vshrq_n_u8(raw, 4)),
+                    );
+                    let w = vqtbl1q_s8(table, idx);
+                    let dot = vaddvq_s32(vdotq_s32(zero, w, vld1q_s8(qp)));
+                    sum += d * (dot as f32);
+                    qp = qp.add(16);
+                }
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q5_1_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 24);
+            let lo4 = vdupq_n_u8(0x0F);
+            let one = vdupq_n_u8(1);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            let bp = qx.bsum.as_ptr();
+            for bi in 0..nb {
+                let p = src.as_ptr().add(bi * 24);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(bi);
+                let m = f16::from_le_bytes([*p.add(2), *p.add(3)]).to_f32();
+                let qs = p.add(8);
+                let qh = p.add(4);
+
+                // Expand each packed byte into [low nibble, high nibble].
+                let raw = vld1q_u8(qs);
+                let nib = vandq_u8(raw, lo4);
+                let hib = vshrq_n_u8(raw, 4);
+                let w0 = vzip1q_u8(nib, hib);
+                let w1 = vzip2q_u8(nib, hib);
+
+                // High bit j/8 from the four qh bytes; bit position j%8 per lane.
+                let mut hb = [0u8; 16];
+                let mut hs = [0i8; 16];
+                for i in 0..8 {
+                    hb[i] = *qh;
+                    hb[8 + i] = *qh.add(1);
+                    hs[i] = -(i as i8);
+                    hs[8 + i] = -(i as i8);
+                }
+                let high0 = vshlq_n_u8(
+                    vandq_u8(vshlq_u8(vld1q_u8(hb.as_ptr()), vld1q_s8(hs.as_ptr())), one),
+                    4,
+                );
+                hb[..8].copy_from_slice(&[*qh.add(2); 8]);
+                hb[8..].copy_from_slice(&[*qh.add(3); 8]);
+                let high1 = vshlq_n_u8(
+                    vandq_u8(vshlq_u8(vld1q_u8(hb.as_ptr()), vld1q_s8(hs.as_ptr())), one),
+                    4,
+                );
+
+                let v0 = vorrq_u8(w0, high0);
+                let v1 = vorrq_u8(w1, high1);
+                let dot0 = vaddvq_s32(vdotq_s32(zero, vreinterpretq_s8_u8(v0), vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vreinterpretq_s8_u8(v1),
+                    vld1q_s8(qp.add(16)),
+                ));
+                sum += d * ((dot0 + dot1) as f32);
+                min_acc += m * *bp.add(bi);
+                qp = qp.add(32);
+            }
+            sum - min_acc
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q8_0_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 34);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for b in 0..nb {
+                let p = src.as_ptr().add(b * 34);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(b);
+                let dot0 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vld1q_s8(p.add(2) as *const i8),
+                    vld1q_s8(qp),
+                ));
+                let dot1 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vld1q_s8(p.add(18) as *const i8),
+                    vld1q_s8(qp.add(16)),
+                ));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q5k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nsb = qx.qs.len() / 256;
+            debug_assert!(src.len() >= nsb * 176);
+            let lo4 = vdupq_n_u8(0x0F);
+            let one = vdupq_n_u8(1);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            let bp = qx.bsum.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 176);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                let dmin = f16::from_le_bytes([*b.add(2), *b.add(3)]).to_f32();
+                let scales = std::slice::from_raw_parts(b.add(4), 12);
+                let qh = b.add(16);
+                let qs = b.add(48);
+                for s in 0..8usize {
+                    let (sc, m) = scale_min_k4(s, scales);
+                    let nibbles = qs.add(32 * (s / 2));
+                    let scale = d * (sc as f32) * *dp.add(sb * 8 + s);
+                    for half in 0..2usize {
+                        let raw = vld1q_u8(nibbles.add(half * 16));
+                        let nib = if s & 1 == 0 {
+                            vandq_u8(raw, lo4)
+                        } else {
+                            vshrq_n_u8(raw, 4)
+                        };
+                        let hi = vandq_u8(
+                            vshlq_u8(vld1q_u8(qh.add(half * 16)), vdupq_n_s8(-(s as i8))),
+                            one,
+                        );
+                        let w = vorrq_u8(nib, vshlq_n_u8(hi, 4));
+                        let dot = vaddvq_s32(vdotq_s32(
+                            zero,
+                            vreinterpretq_s8_u8(w),
+                            vld1q_s8(qp.add(half * 16)),
+                        ));
+                        sum += (dot as f32) * scale;
+                    }
+                    min_acc += dmin * (m as f32) * *bp.add(sb * 8 + s);
+                    qp = qp.add(32);
+                }
+            }
+            sum - min_acc
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q3k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nsb = qx.qs.len() / 256;
+            debug_assert!(src.len() >= nsb * 110);
+            let three = vdupq_n_u8(3);
+            let four = vdupq_n_u8(4);
+            let zero8 = vdupq_n_u8(0);
+            let zero32 = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 110);
+                let d = f16::from_le_bytes([*b.add(108), *b.add(109)]).to_f32();
+                let sc = b.add(96);
+                let hm = b;
+                let qs = b.add(32);
+                for s in 0..8usize {
+                    let (n, j) = (s / 4, s % 4);
+                    let qn = qs.add(32 * n);
+                    // `n*4+j` is the bit position within each sign byte, not a byte index.
+                    let mask = vdupq_n_u8(1u8 << (n * 4 + j));
+                    for half in 0..2usize {
+                        let sign_bits = vld1q_u8(hm.add(16 * half));
+                        let q = vandq_u8(
+                            vshlq_u8(vld1q_u8(qn.add(16 * half)), vdupq_n_s8(-((2 * j) as i8))),
+                            three,
+                        );
+                        // A clear sign bit contributes +4 before subtraction, i.e. -4..3.
+                        let hi = vandq_u8(vceqq_u8(vandq_u8(sign_bits, mask), zero8), four);
+                        let w = vreinterpretq_s8_u8(vsubq_u8(q, hi));
+                        let dot = vaddvq_s32(vdotq_s32(zero32, w, vld1q_s8(qp)));
+                        let scale = d
+                            * *dp.add(sb * 8 + s)
+                            * crate::quant::q3k_scale(
+                                std::slice::from_raw_parts(sc, 12),
+                                s * 2 + half,
+                            ) as f32;
+                        sum += (dot as f32) * scale;
+                        qp = qp.add(16);
+                    }
+                }
+            }
+            sum
+        }
+    }
+
     #[target_feature(enable = "dotprod")]
     unsafe fn dot_q4k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
         unsafe {
@@ -1649,6 +2316,431 @@ mod neon {
             }
             let qx = QuantX::from_f32(&x);
             (src, x, qx)
+        }
+
+        fn sample_dot(ty: GgmlType, blocks: usize) -> (Vec<u8>, Vec<f32>, QuantX) {
+            let (be, bb) = ty.block();
+            let mut state = 0x5bf0_36a8_5eb3_7f11u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let src: Vec<u8> = (0..blocks * bb).map(|_| next() as u8).collect();
+            let x: Vec<f32> = (0..blocks * be)
+                .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+                .collect();
+            let qx = QuantX::from_f32(&x);
+            (src, x, qx)
+        }
+
+        fn assert_close(ty: GgmlType, neon: Option<f32>, reference: f32) {
+            let v = neon.expect("DotProd is available on this host");
+            assert!(
+                (v - reference).abs() <= 1e-3 * reference.abs().max(1.0),
+                "{ty:?}: neon={v} reference={reference}"
+            );
+        }
+
+        /// Quantized-activation references: the SIMD kernels use `qx.qs * qx.d`, not the
+        /// full-precision `x` that `dot_scalar` uses.
+        fn mxfp4_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            for b in 0..qx.d.len() {
+                let p = &src[b * 17..];
+                let d = E8M0_LUT[p[0] as usize] * qx.d[b];
+                let mut dot = 0i32;
+                for j in 0..16 {
+                    dot +=
+                        MXFP4_VALUES[(p[1 + j] & 0xF) as usize] as i32 * qx.qs[b * 32 + j] as i32;
+                    dot += MXFP4_VALUES[(p[1 + j] >> 4) as usize] as i32
+                        * qx.qs[b * 32 + 16 + j] as i32;
+                }
+                sum += d * dot as f32;
+            }
+            sum
+        }
+
+        fn q8_0_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            for b in 0..qx.d.len() {
+                let p = &src[b * 34..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[b];
+                let mut dot = 0i32;
+                for j in 0..32 {
+                    dot += (p[2 + j] as i8) as i32 * qx.qs[b * 32 + j] as i32;
+                }
+                sum += d * dot as f32;
+            }
+            sum
+        }
+
+        #[test]
+        fn iq2s_neon_matches_ordered_scalar() {
+            use crate::iq_grids::IQ2S_GRID;
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq2S, 2);
+            let mut expected = 0.0f32;
+            for sb in 0..qx.d.len() / 8 {
+                let b = &src[sb * 82..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for s in 0..8usize {
+                    for l in 0..4usize {
+                        let idx = b[2 + 4 * s + l] as usize
+                            | (((b[66 + s] as usize) << (8 - 2 * l)) & 0x300);
+                        let grid = IQ2S_GRID[idx].to_le_bytes();
+                        let sg = b[34 + 4 * s + l];
+                        let dot: i32 = (0..8)
+                            .map(|j| {
+                                let w = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                    -1
+                                } else {
+                                    1
+                                });
+                                w as i32 * qx.qs[sb * 256 + s * 32 + 8 * l + j] as i32
+                            })
+                            .sum();
+                        let sc = if l % 2 == 0 {
+                            b[74 + s] & 0xF
+                        } else {
+                            b[74 + s] >> 4
+                        };
+                        expected += d * (0.5 + sc as f32) * 0.25 * qx.d[sb * 8 + s] * dot as f32;
+                    }
+                }
+            }
+            assert_close(GgmlType::Iq2S, dot_iq2s_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn iq2xxs_neon_matches_ordered_scalar() {
+            use crate::iq_grids::IQ2XXS_GRID;
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq2Xxs, 2);
+            let mut expected = 0.0f32;
+            for sb in 0..qx.d.len() / 8 {
+                let b = &src[sb * 66..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for ib in 0..8usize {
+                    let q = &b[2 + 8 * ib..];
+                    let aux1 = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+                    let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25 * qx.d[sb * 8 + ib];
+                    let mut dot = 0i32;
+                    for l in 0..4usize {
+                        let grid = IQ2XXS_GRID[q[l] as usize].to_le_bytes();
+                        let sg = crate::quant::ksign(((aux1 >> (7 * l)) & 127) as usize);
+                        for j in 0..8 {
+                            let w = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                -1
+                            } else {
+                                1
+                            });
+                            dot += w as i32 * qx.qs[sb * 256 + ib * 32 + 8 * l + j] as i32;
+                        }
+                    }
+                    expected += db * dot as f32;
+                }
+            }
+            assert_close(GgmlType::Iq2Xxs, dot_iq2xxs_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn iq2xs_neon_matches_ordered_scalar() {
+            use crate::iq_grids::IQ2XS_GRID;
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq2Xs, 2);
+            let mut expected = 0.0f32;
+            for sb in 0..qx.d.len() / 8 {
+                let b = &src[sb * 74..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for ib in 0..8usize {
+                    for l in 0..4usize {
+                        let k = 4 * ib + l;
+                        let q = u16::from_le_bytes([b[2 + 2 * k], b[2 + 2 * k + 1]]);
+                        let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+                        let sg = crate::quant::ksign((q >> 9) as usize);
+                        let dot: i32 = (0..8)
+                            .map(|j| {
+                                let w = (grid[j] as i8).wrapping_mul(if sg & (1 << j) != 0 {
+                                    -1
+                                } else {
+                                    1
+                                });
+                                w as i32 * qx.qs[sb * 256 + ib * 32 + 8 * l + j] as i32
+                            })
+                            .sum();
+                        let sc = b[66 + ib];
+                        let sc = if l % 2 == 0 { sc & 0xF } else { sc >> 4 };
+                        expected += d * (0.5 + sc as f32) * 0.25 * qx.d[sb * 8 + ib] * dot as f32;
+                    }
+                }
+            }
+            assert_close(GgmlType::Iq2Xs, dot_iq2xs_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn iq3s_neon_matches_ordered_scalar() {
+            use crate::iq_grids::IQ3S_GRID;
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq3S, 2);
+            let mut expected = 0.0f32;
+            for sb in 0..qx.d.len() / 8 {
+                let b = &src[sb * 110..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for s in 0..8usize {
+                    let qh = b[66 + s] as u32;
+                    let mut w = [0i8; 32];
+                    for l in 0..4usize {
+                        let i1 =
+                            b[2 + 8 * s + 2 * l] as usize | ((qh << (8 - 2 * l)) & 256) as usize;
+                        let i2 = b[2 + 8 * s + 2 * l + 1] as usize
+                            | ((qh << (7 - 2 * l)) & 256) as usize;
+                        let g1 = IQ3S_GRID[i1].to_le_bytes();
+                        let g2 = IQ3S_GRID[i2].to_le_bytes();
+                        let sg = SIGN_LUT[b[74 + 4 * s + l] as usize].to_le_bytes();
+                        for j in 0..4 {
+                            w[8 * l + j] = (g1[j] as i8).wrapping_mul(sg[j] as i8);
+                            w[8 * l + 4 + j] = (g2[j] as i8).wrapping_mul(sg[j + 4] as i8);
+                        }
+                    }
+                    let dot: i32 = w
+                        .iter()
+                        .zip(&qx.qs[sb * 256 + s * 32..sb * 256 + (s + 1) * 32])
+                        .map(|(&a, &b)| a as i32 * b as i32)
+                        .sum();
+                    let sc = 1.0 + 2.0 * ((b[106 + s / 2] >> (4 * (s % 2))) & 0xF) as f32;
+                    expected += d * sc * qx.d[sb * 8 + s] * dot as f32;
+                }
+            }
+            assert_close(GgmlType::Iq3S, dot_iq3s_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn iq3xxs_neon_matches_ordered_scalar() {
+            use crate::iq_grids::IQ3XXS_GRID;
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq3Xxs, 2);
+            let mut expected = 0.0f32;
+            for sb in 0..qx.d.len() / 8 {
+                let b = &src[sb * 98..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                for s in 0..8usize {
+                    let aux = u32::from_le_bytes([
+                        b[66 + 4 * s],
+                        b[67 + 4 * s],
+                        b[68 + 4 * s],
+                        b[69 + 4 * s],
+                    ]);
+                    let mut w = [0i8; 32];
+                    for l in 0..4usize {
+                        let g1 = IQ3XXS_GRID[b[2 + 8 * s + 2 * l] as usize].to_le_bytes();
+                        let g2 = IQ3XXS_GRID[b[2 + 8 * s + 2 * l + 1] as usize].to_le_bytes();
+                        let sg = SIGN_LUT
+                            [crate::quant::ksign(((aux >> (7 * l)) & 127) as usize) as usize]
+                            .to_le_bytes();
+                        for j in 0..4 {
+                            w[8 * l + j] = (g1[j] as i8).wrapping_mul(sg[j] as i8);
+                            w[8 * l + 4 + j] = (g2[j] as i8).wrapping_mul(sg[j + 4] as i8);
+                        }
+                    }
+                    let dot: i32 = w
+                        .iter()
+                        .zip(&qx.qs[sb * 256 + s * 32..sb * 256 + (s + 1) * 32])
+                        .map(|(&a, &b)| a as i32 * b as i32)
+                        .sum();
+                    let scale = d * (0.5 + (aux >> 28) as f32) * 0.5 * qx.d[sb * 8 + s];
+                    expected += scale * dot as f32;
+                }
+            }
+            assert_close(GgmlType::Iq3Xxs, dot_iq3xxs_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn iq4nl_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Iq4Nl, 4);
+            let mut expected = 0.0f32;
+            for bi in 0..qx.d.len() {
+                let p = &src[bi * 18..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[bi];
+                let mut dot = 0i32;
+                for j in 0..16 {
+                    dot += crate::quant::KVALUES_IQ4NL[(p[2 + j] & 0xF) as usize] as i32
+                        * qx.qs[bi * 32 + j] as i32;
+                    dot += crate::quant::KVALUES_IQ4NL[(p[2 + j] >> 4) as usize] as i32
+                        * qx.qs[bi * 32 + 16 + j] as i32;
+                }
+                expected += d * dot as f32;
+            }
+            assert_close(GgmlType::Iq4Nl, dot_iq4nl_q8(&src, &qx), expected);
+        }
+
+        #[test]
+        fn nvfp4_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Nvfp4, 4);
+            let mut expected = 0.0f32;
+            for bi in 0..qx.d.len() / 2 {
+                let p = &src[bi * 36..];
+                for s in 0..4 {
+                    let d = crate::quant::ue4m3_half(p[s]) * qx.d[bi * 2 + s / 2];
+                    let mut dot = 0i32;
+                    for j in 0..8 {
+                        let b = p[4 + 8 * s + j];
+                        dot += MXFP4_VALUES[(b & 0xF) as usize] as i32
+                            * qx.qs[bi * 64 + 16 * s + j] as i32;
+                        dot += MXFP4_VALUES[(b >> 4) as usize] as i32
+                            * qx.qs[bi * 64 + 16 * s + 8 + j] as i32;
+                    }
+                    expected += d * dot as f32;
+                }
+            }
+            assert_close(GgmlType::Nvfp4, dot_nvfp4_q8(&src, &qx), expected);
+        }
+
+        fn q5_1_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            for bi in 0..qx.d.len() {
+                let p = &src[bi * 24..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[bi];
+                let m = f16::from_le_bytes([p[2], p[3]]).to_f32();
+                let mut dot = 0i32;
+                for j in 0..32 {
+                    let lo = ((p[8 + j / 2] >> (4 * (j % 2))) & 0xF) as i32;
+                    let hi = (((p[4 + j / 8] >> (j % 8)) & 1) << 4) as i32;
+                    dot += (lo | hi) * qx.qs[bi * 32 + j] as i32;
+                }
+                sum += d * dot as f32;
+                min_acc += m * qx.bsum[bi];
+            }
+            sum - min_acc
+        }
+
+        #[test]
+        fn q5_1_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q5_1, 4);
+            assert_close(
+                GgmlType::Q5_1,
+                dot_q5_1_q8(&src, &qx),
+                q5_1_ordered(&src, &qx),
+            );
+        }
+
+        fn q5k_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let nsb = qx.d.len() / 8;
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            for sb in 0..nsb {
+                let b = &src[sb * 176..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                for s in 0..8 {
+                    let (sc, m) = scale_min_k4(s, &b[4..16]);
+                    let mut dot = 0i32;
+                    for l in 0..32 {
+                        let lo = (b[48 + 32 * (s / 2) + l] >> (4 * (s & 1))) & 0xF;
+                        let hi = ((b[16 + l] >> s) & 1) << 4;
+                        dot += (lo | hi) as i32 * qx.qs[sb * 256 + s * 32 + l] as i32;
+                    }
+                    let bi = sb * 8 + s;
+                    sum += (dot as f32) * (d * (sc as f32) * qx.d[bi]);
+                    min_acc += dmin * (m as f32) * qx.bsum[bi];
+                }
+            }
+            sum - min_acc
+        }
+
+        fn q3k_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let nsb = qx.d.len() / 8;
+            let mut sum = 0.0f32;
+            for sb in 0..nsb {
+                let b = &src[sb * 110..];
+                let d = f16::from_le_bytes([b[108], b[109]]).to_f32();
+                for s in 0..8 {
+                    let (n, j) = (s / 4, s % 4);
+                    for half in 0..2 {
+                        let dl = d
+                            * qx.d[sb * 8 + s]
+                            * crate::quant::q3k_scale(&b[96..108], s * 2 + half) as f32;
+                        let mut dot = 0i32;
+                        for l in 0..16 {
+                            let li = half * 16 + l;
+                            let q = (b[32 + 32 * n + li] >> (2 * j)) & 3;
+                            let hi = if b[li] & (1 << (n * 4 + j)) != 0 {
+                                0
+                            } else {
+                                4
+                            };
+                            dot += (q as i32 - hi) * qx.qs[sb * 256 + s * 32 + li] as i32;
+                        }
+                        sum += dl * dot as f32;
+                    }
+                }
+            }
+            sum
+        }
+
+        #[test]
+        fn mxfp4_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Mxfp4, 4);
+            assert_close(
+                GgmlType::Mxfp4,
+                dot_mxfp4_q8(&src, &qx),
+                mxfp4_ordered(&src, &qx),
+            );
+        }
+
+        #[test]
+        fn q8_0_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q8_0, 4);
+            assert_close(
+                GgmlType::Q8_0,
+                dot_q8_0_q8(&src, &qx),
+                q8_0_ordered(&src, &qx),
+            );
+        }
+
+        #[test]
+        fn q5k_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q5K, 4);
+            assert_close(GgmlType::Q5K, dot_q5k_q8(&src, &qx), q5k_ordered(&src, &qx));
+        }
+
+        #[test]
+        fn q3k_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q3K, 4);
+            assert_close(GgmlType::Q3K, dot_q3k_q8(&src, &qx), q3k_ordered(&src, &qx));
         }
 
         /// Order-matched scalar reference for the Q4_K kernel above.
