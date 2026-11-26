@@ -193,8 +193,12 @@ pub(crate) fn neon_available() -> bool {
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn neon_dot_q8(ty: GgmlType, src: &[u8], qx: &QuantX) -> Option<f32> {
     match ty {
+        GgmlType::Mxfp4 => neon::dot_mxfp4_q8(src, qx),
+        GgmlType::Q5K => neon::dot_q5k_q8(src, qx),
         GgmlType::Q6K => neon::dot_q6k_q8(src, qx),
         GgmlType::Q4K => neon::dot_q4k_q8(src, qx),
+        GgmlType::Q3K => neon::dot_q3k_q8(src, qx),
+        GgmlType::Q8_0 => neon::dot_q8_0_q8(src, qx),
         _ => None,
     }
 }
@@ -1470,6 +1474,193 @@ mod neon {
         Some(unsafe { dot_q4k_q8_dotprod(src, qx) })
     }
 
+    /// MXFP4 superblocks (17-byte blocks: E8M0 scale + 16 packed nibbles).
+    pub fn dot_mxfp4_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_mxfp4_q8_dotprod(src, qx) })
+    }
+
+    /// Q5_K superblocks (176-byte blocks).
+    pub fn dot_q5k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q5k_q8_dotprod(src, qx) })
+    }
+
+    /// Q8_0 blocks (34 bytes: f16 scale + 32 i8 weights).
+    pub fn dot_q8_0_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q8_0_q8_dotprod(src, qx) })
+    }
+
+    /// Q3_K superblocks (110 bytes).
+    pub fn dot_q3k_q8(src: &[u8], qx: &QuantX) -> Option<f32> {
+        if !dotprod_available() {
+            return None;
+        }
+        Some(unsafe { dot_q3k_q8_dotprod(src, qx) })
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_mxfp4_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 17);
+            let lo4 = vdupq_n_u8(0x0F);
+            let zero = vdupq_n_s32(0);
+            // The 16-entry table covers both signs: indices 0..7 are positive, 8..15 negative.
+            let table = vld1q_s8(MXFP4_VALUES.as_ptr());
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for b in 0..nb {
+                let p = src.as_ptr().add(b * 17);
+                let d = E8M0_LUT[*p as usize] * *dp.add(b);
+                let packed = vld1q_u8(p.add(1));
+                let w0 = vqtbl1q_s8(table, vandq_u8(packed, lo4));
+                let w1 = vqtbl1q_s8(table, vshrq_n_u8(packed, 4));
+                let dot0 = vaddvq_s32(vdotq_s32(zero, w0, vld1q_s8(qp)));
+                let dot1 = vaddvq_s32(vdotq_s32(zero, w1, vld1q_s8(qp.add(16))));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q8_0_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nb = qx.qs.len() / 32;
+            debug_assert!(src.len() >= nb * 34);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for b in 0..nb {
+                let p = src.as_ptr().add(b * 34);
+                let d = f16::from_le_bytes([*p, *p.add(1)]).to_f32() * *dp.add(b);
+                let dot0 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vld1q_s8(p.add(2) as *const i8),
+                    vld1q_s8(qp),
+                ));
+                let dot1 = vaddvq_s32(vdotq_s32(
+                    zero,
+                    vld1q_s8(p.add(18) as *const i8),
+                    vld1q_s8(qp.add(16)),
+                ));
+                sum += d * ((dot0 + dot1) as f32);
+                qp = qp.add(32);
+            }
+            sum
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q5k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nsb = qx.qs.len() / 256;
+            debug_assert!(src.len() >= nsb * 176);
+            let lo4 = vdupq_n_u8(0x0F);
+            let one = vdupq_n_u8(1);
+            let zero = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            let bp = qx.bsum.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 176);
+                let d = f16::from_le_bytes([*b, *b.add(1)]).to_f32();
+                let dmin = f16::from_le_bytes([*b.add(2), *b.add(3)]).to_f32();
+                let scales = std::slice::from_raw_parts(b.add(4), 12);
+                let qh = b.add(16);
+                let qs = b.add(48);
+                for s in 0..8usize {
+                    let (sc, m) = scale_min_k4(s, scales);
+                    let nibbles = qs.add(32 * (s / 2));
+                    let scale = d * (sc as f32) * *dp.add(sb * 8 + s);
+                    for half in 0..2usize {
+                        let raw = vld1q_u8(nibbles.add(half * 16));
+                        let nib = if s & 1 == 0 {
+                            vandq_u8(raw, lo4)
+                        } else {
+                            vshrq_n_u8(raw, 4)
+                        };
+                        let hi = vandq_u8(
+                            vshlq_u8(vld1q_u8(qh.add(half * 16)), vdupq_n_s8(-(s as i8))),
+                            one,
+                        );
+                        let w = vorrq_u8(nib, vshlq_n_u8(hi, 4));
+                        let dot = vaddvq_s32(vdotq_s32(
+                            zero,
+                            vreinterpretq_s8_u8(w),
+                            vld1q_s8(qp.add(half * 16)),
+                        ));
+                        sum += (dot as f32) * scale;
+                    }
+                    min_acc += dmin * (m as f32) * *bp.add(sb * 8 + s);
+                    qp = qp.add(32);
+                }
+            }
+            sum - min_acc
+        }
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot_q3k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
+        unsafe {
+            let nsb = qx.qs.len() / 256;
+            debug_assert!(src.len() >= nsb * 110);
+            let three = vdupq_n_u8(3);
+            let four = vdupq_n_u8(4);
+            let zero8 = vdupq_n_u8(0);
+            let zero32 = vdupq_n_s32(0);
+            let mut sum = 0.0f32;
+            let mut qp = qx.qs.as_ptr();
+            let dp = qx.d.as_ptr();
+            for sb in 0..nsb {
+                let b = src.as_ptr().add(sb * 110);
+                let d = f16::from_le_bytes([*b.add(108), *b.add(109)]).to_f32();
+                let sc = b.add(96);
+                let hm = b;
+                let qs = b.add(32);
+                for s in 0..8usize {
+                    let (n, j) = (s / 4, s % 4);
+                    let qn = qs.add(32 * n);
+                    // `n*4+j` is the bit position within each sign byte, not a byte index.
+                    let mask = vdupq_n_u8(1u8 << (n * 4 + j));
+                    for half in 0..2usize {
+                        let sign_bits = vld1q_u8(hm.add(16 * half));
+                        let q = vandq_u8(
+                            vshlq_u8(vld1q_u8(qn.add(16 * half)), vdupq_n_s8(-((2 * j) as i8))),
+                            three,
+                        );
+                        // A clear sign bit contributes +4 before subtraction, i.e. -4..3.
+                        let hi = vandq_u8(vceqq_u8(vandq_u8(sign_bits, mask), zero8), four);
+                        let w = vreinterpretq_s8_u8(vsubq_u8(q, hi));
+                        let dot = vaddvq_s32(vdotq_s32(zero32, w, vld1q_s8(qp)));
+                        let scale = d
+                            * *dp.add(sb * 8 + s)
+                            * crate::quant::q3k_scale(
+                                std::slice::from_raw_parts(sc, 12),
+                                s * 2 + half,
+                            ) as f32;
+                        sum += (dot as f32) * scale;
+                        qp = qp.add(16);
+                    }
+                }
+            }
+            sum
+        }
+    }
+
     #[target_feature(enable = "dotprod")]
     unsafe fn dot_q4k_q8_dotprod(src: &[u8], qx: &QuantX) -> f32 {
         unsafe {
@@ -1649,6 +1840,162 @@ mod neon {
             }
             let qx = QuantX::from_f32(&x);
             (src, x, qx)
+        }
+
+        fn sample_dot(ty: GgmlType, blocks: usize) -> (Vec<u8>, Vec<f32>, QuantX) {
+            let (be, bb) = ty.block();
+            let mut state = 0x5bf0_36a8_5eb3_7f11u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let src: Vec<u8> = (0..blocks * bb).map(|_| next() as u8).collect();
+            let x: Vec<f32> = (0..blocks * be)
+                .map(|_| ((next() >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+                .collect();
+            let qx = QuantX::from_f32(&x);
+            (src, x, qx)
+        }
+
+        fn assert_close(ty: GgmlType, neon: Option<f32>, reference: f32) {
+            let v = neon.expect("DotProd is available on this host");
+            assert!(
+                (v - reference).abs() <= 1e-3 * reference.abs().max(1.0),
+                "{ty:?}: neon={v} reference={reference}"
+            );
+        }
+
+        /// Quantized-activation references: the SIMD kernels use `qx.qs * qx.d`, not the
+        /// full-precision `x` that `dot_scalar` uses.
+        fn mxfp4_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            for b in 0..qx.d.len() {
+                let p = &src[b * 17..];
+                let d = E8M0_LUT[p[0] as usize] * qx.d[b];
+                let mut dot = 0i32;
+                for j in 0..16 {
+                    dot +=
+                        MXFP4_VALUES[(p[1 + j] & 0xF) as usize] as i32 * qx.qs[b * 32 + j] as i32;
+                    dot += MXFP4_VALUES[(p[1 + j] >> 4) as usize] as i32
+                        * qx.qs[b * 32 + 16 + j] as i32;
+                }
+                sum += d * dot as f32;
+            }
+            sum
+        }
+
+        fn q8_0_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let mut sum = 0.0f32;
+            for b in 0..qx.d.len() {
+                let p = &src[b * 34..];
+                let d = f16::from_le_bytes([p[0], p[1]]).to_f32() * qx.d[b];
+                let mut dot = 0i32;
+                for j in 0..32 {
+                    dot += (p[2 + j] as i8) as i32 * qx.qs[b * 32 + j] as i32;
+                }
+                sum += d * dot as f32;
+            }
+            sum
+        }
+
+        fn q5k_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let nsb = qx.d.len() / 8;
+            let mut sum = 0.0f32;
+            let mut min_acc = 0.0f32;
+            for sb in 0..nsb {
+                let b = &src[sb * 176..];
+                let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
+                let dmin = f16::from_le_bytes([b[2], b[3]]).to_f32();
+                for s in 0..8 {
+                    let (sc, m) = scale_min_k4(s, &b[4..16]);
+                    let mut dot = 0i32;
+                    for l in 0..32 {
+                        let lo = (b[48 + 32 * (s / 2) + l] >> (4 * (s & 1))) & 0xF;
+                        let hi = ((b[16 + l] >> s) & 1) << 4;
+                        dot += (lo | hi) as i32 * qx.qs[sb * 256 + s * 32 + l] as i32;
+                    }
+                    let bi = sb * 8 + s;
+                    sum += (dot as f32) * (d * (sc as f32) * qx.d[bi]);
+                    min_acc += dmin * (m as f32) * qx.bsum[bi];
+                }
+            }
+            sum - min_acc
+        }
+
+        fn q3k_ordered(src: &[u8], qx: &QuantX) -> f32 {
+            let nsb = qx.d.len() / 8;
+            let mut sum = 0.0f32;
+            for sb in 0..nsb {
+                let b = &src[sb * 110..];
+                let d = f16::from_le_bytes([b[108], b[109]]).to_f32();
+                for s in 0..8 {
+                    let (n, j) = (s / 4, s % 4);
+                    for half in 0..2 {
+                        let dl = d
+                            * qx.d[sb * 8 + s]
+                            * crate::quant::q3k_scale(&b[96..108], s * 2 + half) as f32;
+                        let mut dot = 0i32;
+                        for l in 0..16 {
+                            let li = half * 16 + l;
+                            let q = (b[32 + 32 * n + li] >> (2 * j)) & 3;
+                            let hi = if b[li] & (1 << (n * 4 + j)) != 0 {
+                                0
+                            } else {
+                                4
+                            };
+                            dot += (q as i32 - hi) * qx.qs[sb * 256 + s * 32 + li] as i32;
+                        }
+                        sum += dl * dot as f32;
+                    }
+                }
+            }
+            sum
+        }
+
+        #[test]
+        fn mxfp4_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Mxfp4, 4);
+            assert_close(
+                GgmlType::Mxfp4,
+                dot_mxfp4_q8(&src, &qx),
+                mxfp4_ordered(&src, &qx),
+            );
+        }
+
+        #[test]
+        fn q8_0_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q8_0, 4);
+            assert_close(
+                GgmlType::Q8_0,
+                dot_q8_0_q8(&src, &qx),
+                q8_0_ordered(&src, &qx),
+            );
+        }
+
+        #[test]
+        fn q5k_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q5K, 4);
+            assert_close(GgmlType::Q5K, dot_q5k_q8(&src, &qx), q5k_ordered(&src, &qx));
+        }
+
+        #[test]
+        fn q3k_neon_matches_ordered_scalar() {
+            if !dotprod_available() {
+                return;
+            }
+            let (src, _, qx) = sample_dot(GgmlType::Q3K, 4);
+            assert_close(GgmlType::Q3K, dot_q3k_q8(&src, &qx), q3k_ordered(&src, &qx));
         }
 
         /// Order-matched scalar reference for the Q4_K kernel above.
