@@ -51,14 +51,7 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        let argmax = || {
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0)
-        };
+        let argmax = || crate::vec::backend().argmax(logits) as u32;
         if self.p.is_greedy() {
             return argmax();
         }

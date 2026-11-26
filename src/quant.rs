@@ -188,7 +188,7 @@ fn e8m0_half(e: u8) -> f32 {
 
 /// UE4M3 scale (4 exponent bits, bias 7, 3 mantissa bits), halved to match the doubled
 /// E2M1 table, as in ggml's `ggml_ue4m3_to_fp32`.
-fn ue4m3_half(e: u8) -> f32 {
+pub(crate) fn ue4m3_half(e: u8) -> f32 {
     if e == 0 || e == 0x7F {
         return 0.0;
     }
@@ -201,7 +201,7 @@ fn ue4m3_half(e: u8) -> f32 {
     raw * 0.5
 }
 
-const KVALUES_IQ4NL: [i8; 16] = [
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
@@ -241,13 +241,18 @@ pub fn dequant(ty: GgmlType, src: &[u8], out: &mut [f32]) {
         }
         GgmlType::Q5_1 => {
             for (y, b) in out.chunks_exact_mut(be).zip(src.chunks_exact(bb)) {
+                // ggml's block_q5_1 stores the high bits in a 32-bit word: bit `j` for the
+                // first 16 values and bit `j+12` for the second 16, and `m` is `-min`
+                // (so dequantization ADDS it). Both differ from a naive nibble unpack.
                 let d = f16::from_le_bytes([b[0], b[1]]).to_f32();
                 let m = f16::from_le_bytes([b[2], b[3]]).to_f32();
-                let (qh, qs) = (&b[4..8], &b[8..24]);
-                for j in 0..32 {
-                    let lo = ((qs[j / 2] >> (4 * (j % 2))) & 0xF) as u32;
-                    let hi = (((qh[j / 8] >> (j % 8)) & 1) << 4) as u32;
-                    y[j] = d * (lo | hi) as f32 - m;
+                let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let qs = &b[8..24];
+                for j in 0..16 {
+                    let x0 = (qs[j] & 0x0F) | (((qh >> j) << 4) & 0x10) as u8;
+                    let x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10) as u8;
+                    y[j] = d * x0 as f32 + m;
+                    y[j + 16] = d * x1 as f32 + m;
                 }
             }
         }
@@ -673,10 +678,11 @@ mod tests {
         block[8] = 0x10; // value 0 low nibble 0, value 1 low nibble 1
         let mut out = [0f32; 32];
         dequant(GgmlType::Q5_1, &block, &mut out);
-        assert_eq!(out[0], 0.5 * 0.0 - 1.0);
-        assert_eq!(out[1], 0.5 * 1.0 - 1.0);
-        // Value 2's high bit is bit 2 of qh[0] (0xA5 → 1), its low nibble is 0.
-        assert_eq!(out[2], 0.5 * 16.0 - 1.0);
+        // ggml adds the stored `m` (which is `-min`) and reads high bits from the
+        // 32-bit qh word: bit j for the first half, bit j+12 for the second.
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[1], 1.0);
+        assert_eq!(out[2], 9.0);
         assert_eq!(GgmlType::from_u32(7).unwrap(), GgmlType::Q5_1);
         assert_eq!(GgmlType::Q5_1.block(), (32, 24));
     }

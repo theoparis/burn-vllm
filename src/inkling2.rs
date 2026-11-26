@@ -195,26 +195,21 @@ impl Config {
 }
 
 fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let sum: f32 = x.iter().map(|v| v * v).sum();
-    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
-    x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
+    crate::vec::backend().rms_norm(x, w, eps)
 }
 
 /// Clip each row (head) of `x` to L2 norm <= threshold, after optional per-channel scale.
 fn clip(x: &[f32], width: usize, scale: Option<&[f32]>, threshold: f32) -> Vec<f32> {
     let mut out = x.to_vec();
+    let backend = crate::vec::backend();
     if let Some(s) = scale {
-        for (v, &c) in out.iter_mut().zip(s) {
-            *v *= c;
-        }
+        backend.mul_inplace(&mut out, s);
     }
     for row in out.chunks_exact_mut(width) {
         // llama.cpp: sqrt(sum_rows(sqr(x))) then scale_bias(+1e-6), i.e. sqrt(sum) + eps.
         let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-6;
         let factor = (threshold / norm).min(1.0).max(0.0);
-        for v in row {
-            *v *= factor;
-        }
+        backend.mul_scalar(row, factor);
     }
     out
 }
@@ -243,11 +238,20 @@ fn convolve(
             out[i] += x * weight[i * conv + lag];
         }
         if let Some(d) = dynamic {
+            // llama.cpp indexes the dynamic tap by lag but takes its window from the
+            // OPPOSITE end of the concatenation: tap 0 multiplies `cur`, tap conv-1 the
+            // oldest history row (inkling2.cpp:224-226).
+            let dyn_window = if lag == 0 {
+                cur
+            } else {
+                let row = conv - 1 - lag;
+                &history[row * channels..(row + 1) * channels]
+            };
             let per_head = channels / heads;
             for h in 0..heads {
                 let t = d[h * conv + lag];
                 for i in 0..per_head {
-                    out[h * per_head + i] += window[h * per_head + i] * t;
+                    out[h * per_head + i] += dyn_window[h * per_head + i] * t;
                 }
             }
         }
@@ -361,6 +365,17 @@ fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) ->
         return (0..rows)
             .into_par_iter()
             .map(|r| dot_q8(ty, &raw[r * rb..(r + 1) * rb], &qx, x))
+            .collect();
+    }
+    // Opt-in fused dequant+dot: same element order, no f32 scratch round-trip.
+    if std::env::var_os("INKLING2_FUSED_DOT").is_some() && crate::fused::supports(ty) {
+        use rayon::prelude::*;
+        return (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                crate::fused::dot_row(ty, &raw[r * rb..(r + 1) * rb], x)
+                    .expect("fused format checked by supports()")
+            })
             .collect();
     }
     // Default: exact dequantized dot. Matches llama.cpp's top-1 token on the APEX oracle.
@@ -538,6 +553,18 @@ impl<'a> Model<'a> {
         Ok(out)
     }
 
+    fn dump_layer_tensor(name: &str, data: &[f32]) {
+        let Ok(dir) = std::env::var("INKLING2_DUMP_LAYERS") else {
+            return;
+        };
+        let path = format!("{dir}/rust_s0_{name}.bin");
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).expect("create layer dump");
+        for &v in data {
+            writeln!(f, "{v:.7}").unwrap();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layer(
         &self,
@@ -557,6 +584,9 @@ impl<'a> Model<'a> {
         let n_kv_heads = cfg.n_head_kv;
         let kv_dim = n_kv_heads * cfg.head_dim;
         let inp_sa = x.to_vec();
+        if st.pos == 5 && (slot == 5 || slot == 6) {
+            Self::dump_layer_tensor(&format!("layerin_{slot}"), x);
+        }
 
         // Attention inputs: residual stream, optionally mixed with earlier blocks and
         // merged with the previous pass's gated message.
@@ -566,6 +596,13 @@ impl<'a> Model<'a> {
             let q = self.query(&res_name)?;
             let nq = q.len() / hidden;
             let mixed = mix(blocks, x, &q, hidden, cfg.eps);
+            if st.pos == 5 && (slot == 5 || slot == 6) {
+                Self::dump_layer_tensor(&format!("mixed_{slot}"), &mixed);
+                Self::dump_layer_tensor(&format!("nblocks_{slot}"), &[blocks.len() as f32]);
+                for (bi, b) in blocks.iter().enumerate() {
+                    Self::dump_layer_tensor(&format!("block{bi}_slot{slot}"), b);
+                }
+            }
             for (j, input) in inputs.iter_mut().enumerate() {
                 let off = if is_swa {
                     0
@@ -610,6 +647,9 @@ impl<'a> Model<'a> {
             }
         }
 
+        if st.pos == 5 && slot == 6 {
+            Self::dump_layer_tensor("inputs0_slot6", &inputs[0]);
+        }
         let mut q = self.mat(&format!("{b}attn_q.weight"), &inputs[0])?;
         let mut k = self.mat(&format!("{b}attn_k.weight"), &inputs[1])?;
         let mut v = self.mat(&format!("{b}attn_v.weight"), &inputs[2])?;
@@ -664,9 +704,18 @@ impl<'a> Model<'a> {
                 *x *= tau;
             }
         }
+        if st.pos == 5 {
+            let tag = format!("pos{}", st.pos);
+            Self::dump_layer_tensor(&format!("Qcur_{slot}_{tag}"), &q);
+            Self::dump_layer_tensor(&format!("Kcur_{slot}_{tag}"), &k);
+            Self::dump_layer_tensor(&format!("Vcur_{slot}_{tag}"), &v);
+        }
 
         let sinks = self.mat(&format!("{b}attn_sink_proj.weight"), &inputs[0])?;
         let bias = self.rel_bias(&b, &r, &sinks)?;
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("kq_b_{slot}_pos{}", st.pos), &bias);
+        }
         let kv = &mut st.kv[slot];
         kv.keys.push(k.clone());
         kv.values.push(v.clone());
@@ -687,6 +736,9 @@ impl<'a> Model<'a> {
                 vids.push(val);
             }
             scores.push(0.0); // zero sink
+            if slot == 0 && st.pos == 5 && h == 0 {
+                Self::dump_layer_tensor("scores_h0_pos5", &scores);
+            }
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
@@ -700,6 +752,9 @@ impl<'a> Model<'a> {
             }
         }
 
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("kqv_out_{slot}_pos{}", st.pos), &attn);
+        }
         let gate = self.mat(&format!("{b}attn_gate.weight"), &inputs[0])?;
         for (a, g) in attn.iter_mut().zip(gate) {
             *a *= 1.0 / (1.0 + (-g).exp());
@@ -715,6 +770,9 @@ impl<'a> Model<'a> {
             cfg.hidden,
         )?;
 
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("attn_out_{slot}"), &cur);
+        }
         if ip % cfg.block == 0 {
             blocks.push(inp_sa);
         } else {
@@ -739,6 +797,10 @@ impl<'a> Model<'a> {
         cur = rms_norm(&cur, norm, cfg.eps);
 
         let logits = self.mat(&format!("{b}ffn_gate_inp.weight"), &cur)?;
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("ffn_inp_{slot}"), &ffn_inp);
+            Self::dump_layer_tensor(&format!("ffn_moe_logits_{slot}"), &logits);
+        }
         let probs: Vec<f32> = logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect();
         let bias: &[f32] = bytemuck::cast_slice(self.tensor(&format!("{b}exp_probs_b.bias"))?.1);
         let selection: Vec<(f32, usize)> = probs
@@ -755,6 +817,8 @@ impl<'a> Model<'a> {
         cur = vec![0.0f32; hidden];
         let gu_scale = self.expert_scale(&format!("{b}ffn_gate_up_exps.weight"))?;
         let dn_scale = self.expert_scale(&format!("{b}ffn_down_exps.weight"))?;
+        let mut dump_acts = Vec::new();
+        let mut dump_downs = Vec::new();
         for &(_, e) in &selected {
             let (gu_ty, gu, gu_rows, gu_cols) =
                 self.expert(&format!("{b}ffn_gate_up_exps.weight"), e)?;
@@ -778,10 +842,19 @@ impl<'a> Model<'a> {
             if !dn_scale.is_empty() {
                 down.iter_mut().for_each(|v| *v *= dn_scale[e]);
             }
+            if st.pos == 5 && slot == 5 {
+                dump_acts.extend_from_slice(&act);
+                dump_downs.extend_from_slice(&down);
+            }
             let w = probs[e] / wsum * cfg.expert_scale;
             for (c, d) in cur.iter_mut().zip(down) {
                 *c += w * d;
             }
+        }
+        if st.pos == 5 && slot == 5 {
+            Self::dump_layer_tensor("moe_acts_5", &dump_acts);
+            Self::dump_layer_tensor("moe_downs_5", &dump_downs);
+            Self::dump_layer_tensor("ffn_moe_out_5", &cur);
         }
         let ffn_out = self.convolve(
             st,
@@ -792,6 +865,9 @@ impl<'a> Model<'a> {
             2 * kv_dim + hidden,
             hidden,
         )?;
+        if st.pos == 5 {
+            Self::dump_layer_tensor(&format!("ffn_out_{slot}"), &ffn_out);
+        }
         for (c, f) in ffn_inp.iter_mut().zip(&ffn_out) {
             *c += f;
         }
@@ -818,6 +894,10 @@ impl<'a> Model<'a> {
         let emb = self.embedding(token)?;
         let ln: &[f32] = bytemuck::cast_slice(self.tensor("token_embd_norm.weight")?.1);
         let mut cur = rms_norm(&emb, ln, cfg.eps);
+        if pos == 5 {
+            Self::dump_layer_tensor("embd", &emb);
+            Self::dump_layer_tensor("norm", &cur);
+        }
 
         let tau = 1.0 + cfg.log_alpha * (((pos + 1) / cfg.log_floor).max(1) as f32).ln();
         let mut blocks: Vec<Vec<f32>> = Vec::new();
@@ -910,7 +990,18 @@ pub fn generate(
         logits = model.forward(st, t)?;
     }
     let debug = std::env::var_os("INKLING2_DEBUG").is_some();
+    let dump = std::env::var("INKLING2_DUMP_LOGITS").ok();
+    let mut dump_file = dump
+        .as_ref()
+        .map(|p| std::fs::File::create(p).expect("create INKLING2_DUMP_LOGITS file"));
     for step in 0..max_new {
+        if let Some(f) = dump_file.as_mut() {
+            use std::io::Write;
+            writeln!(f, "STEP {step}").unwrap();
+            for (i, &v) in logits.iter().enumerate() {
+                writeln!(f, "{i} {v:.7}").unwrap();
+            }
+        }
         if debug {
             let mut top: Vec<(f32, usize)> = logits
                 .iter()
