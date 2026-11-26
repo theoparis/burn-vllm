@@ -194,6 +194,115 @@ impl Config {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoopCD decoding (arXiv:2610.02185)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopCdMode {
+    Off,
+    Hidden,
+    Logits,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopCd {
+    mode: LoopCdMode,
+    /// Guidance strength ω; the upper bound when `adaptive` is set.
+    omega: f32,
+    adaptive: bool,
+    /// Zero-based loop pass used as the weak reference (0 = first pass).
+    ref_pass: usize,
+}
+
+impl LoopCd {
+    fn from_env() -> Self {
+        let mode = match std::env::var("LOOPCD").ok().as_deref() {
+            Some("hidden") => LoopCdMode::Hidden,
+            Some("logits") => LoopCdMode::Logits,
+            _ => LoopCdMode::Off,
+        };
+        // The paper's generation window is ω ∈ [0.2, 0.3]; larger values compound errors.
+        let omega = std::env::var("LOOPCD_OMEGA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.25);
+        let adaptive = std::env::var_os("LOOPCD_ADAPTIVE").is_some();
+        let ref_pass = std::env::var("LOOPCD_REF_PASS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        Self {
+            mode,
+            omega,
+            adaptive,
+            ref_pass,
+        }
+    }
+
+    /// Effective strength for this token. Adaptive scaling needs the unguided logits, so it
+    /// is only used by `Logits` mode (Hidden has no extra output pass to read them from).
+    fn strength(&self, logits: &[f32]) -> f32 {
+        if !self.adaptive {
+            return self.omega;
+        }
+        let (mut first, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &v in logits {
+            if v > first {
+                second = first;
+                first = v;
+            } else if v > second {
+                second = v;
+            }
+        }
+        if !second.is_finite() {
+            return 0.0;
+        }
+        // ω = ω_max [1 - (p_(1) - p_(2))], Eq. (4). A softmax shift keeps exp in range.
+        let mut sum = 0.0f32;
+        for &v in logits {
+            sum += (v - first).exp();
+        }
+        let p1 = 1.0 / sum;
+        let p2 = (second - first).exp() / sum;
+        (self.omega * (1.0 - (p1 - p2))).clamp(0.0, self.omega)
+    }
+}
+
+/// `strong + w * (strong - weak)` — continue the direction recurrence took from the weak
+/// state. A zero strength returns the strong vector unchanged (no rounding drift).
+fn extrapolate(strong: &[f32], weak: &[f32], w: f32) -> Vec<f32> {
+    assert_eq!(
+        strong.len(),
+        weak.len(),
+        "LoopCD reference and final states have different lengths"
+    );
+    if w == 0.0 {
+        return strong.to_vec();
+    }
+    strong
+        .iter()
+        .zip(weak)
+        .map(|(&s, &r)| s + w * (s - r))
+        .collect()
+}
+
+/// Softcap and drop padding tokens, exactly as the unguided path always did.
+fn finish_logits(logits: &[f32], cfg: &Config) -> Vec<f32> {
+    logits
+        .iter()
+        .take(cfg.vocab_unpadded)
+        .map(|&v| {
+            if cfg.softcap != 0.0 {
+                cfg.softcap * (v / cfg.softcap).tanh()
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
 fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let sum: f32 = x.iter().map(|v| v * v).sum();
     let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
@@ -381,11 +490,13 @@ fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) ->
 // Model, state and forward pass
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct KvSlot {
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
 }
 
+#[derive(Clone)]
 pub struct State {
     kv: Vec<KvSlot>,
     conv: Vec<Vec<f32>>,
@@ -409,18 +520,62 @@ impl State {
     }
 }
 
+/// Private state branch for the weak coda pass. Only the slots the coda touches are copied;
+/// the real cache keeps the strong path's KV and conv history.
+fn branch_state(st: &State, layers: std::ops::Range<usize>) -> State {
+    let slots = st.kv.len();
+    let mut kv = Vec::with_capacity(slots);
+    let mut conv = Vec::with_capacity(slots);
+    for i in 0..slots {
+        let used = layers.contains(&i);
+        kv.push(if used {
+            st.kv[i].clone()
+        } else {
+            KvSlot {
+                keys: Vec::new(),
+                values: Vec::new(),
+            }
+        });
+        conv.push(if used { st.conv[i].clone() } else { Vec::new() });
+    }
+    State {
+        kv,
+        conv,
+        pos: st.pos,
+    }
+}
+
 pub struct Model<'a> {
     g: &'a Gguf,
     cfg: Config,
+    loopcd: LoopCd,
 }
 
 impl<'a> Model<'a> {
     pub fn new(g: &'a Gguf) -> Result<Self> {
         validate(g)?;
-        Ok(Self {
-            g,
-            cfg: Config::from_gguf(g)?,
-        })
+        let cfg = Config::from_gguf(g)?;
+        let loopcd = LoopCd::from_env();
+        if loopcd.mode != LoopCdMode::Off {
+            ensure!(
+                loopcd.ref_pass < cfg.loop_passes,
+                "LOOPCD_REF_PASS {} >= loop.count {}",
+                loopcd.ref_pass,
+                cfg.loop_passes
+            );
+            if loopcd.mode == LoopCdMode::Hidden && loopcd.adaptive {
+                eprintln!(
+                    "loopcd: ignoring LOOPCD_ADAPTIVE in hidden mode (needs an extra output pass)"
+                );
+            }
+            if std::env::var_os("INKLING2_DEBUG").is_some() {
+                eprintln!(
+                    "loopcd: {:?} omega={} adaptive={} ref_pass={}",
+                    loopcd.mode, loopcd.omega, loopcd.adaptive, loopcd.ref_pass
+                );
+            }
+        }
+        Ok(Self { g, cfg, loopcd })
     }
 
     pub fn config(&self) -> &Config {
@@ -456,6 +611,18 @@ impl<'a> Model<'a> {
     fn query(&self, name: &str) -> Result<Vec<f32>> {
         let (_, raw) = self.tensor(name)?;
         Ok(bytemuck::cast_slice::<u8, f32>(raw).to_vec())
+    }
+
+    /// The fixed post-loop readout: residual attention, final norm, lm_head and softcap.
+    /// Factored out so LoopCD-Logits can decode the reference state through the same path.
+    fn coda(&self, blocks: &[Vec<f32>], cur: &[f32]) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let oq: &[f32] = bytemuck::cast_slice(self.tensor("output_res_query.weight")?.1);
+        let mixed = mix(blocks, cur, oq, cfg.hidden, cfg.eps);
+        let on: &[f32] = bytemuck::cast_slice(self.tensor("output_norm.weight")?.1);
+        let normed = rms_norm(&mixed, on, cfg.eps);
+        let logits = self.mat("output.weight", &normed)?;
+        Ok(finish_logits(&logits, cfg))
     }
 
     /// Read a 1-D F32 tensor (RMSNorm weights, biases) as a vector.
@@ -826,6 +993,9 @@ impl<'a> Model<'a> {
         }
         let prelude = cur.clone();
         let prelude_blocks = blocks.clone();
+        // The selected recurrent state is the weak reference for LoopCD. Capture it before
+        // later passes overwrite `cur` and its residual bank.
+        let mut reference: Option<(Vec<f32>, Vec<Vec<f32>>)> = None;
         for pass in 0..cfg.loop_passes {
             let (bank, bank_out) = if pass > 0 {
                 (
@@ -865,27 +1035,66 @@ impl<'a> Model<'a> {
                     tau,
                 )?;
             }
+            if pass == self.loopcd.ref_pass {
+                reference = Some((cur.clone(), blocks.clone()));
+            }
         }
-        for il in cfg.loop_end..cfg.n_layers {
-            cur = self.layer(st, il, il, il, &cur, &mut blocks, None, tau)?;
+        // LoopCD-Hidden contrasts before the coda layers so they still run exactly once.
+        if self.loopcd.mode == LoopCdMode::Hidden {
+            let (ref_cur, ref_blocks) = reference
+                .as_ref()
+                .expect("LoopCD reference pass was not captured");
+            let w = self.loopcd.omega;
+            cur = extrapolate(&cur, ref_cur, w);
+            let mut guided: Vec<Vec<f32>> = blocks
+                .iter()
+                .zip(ref_blocks)
+                .map(|(s, r)| extrapolate(s, r, w))
+                .collect();
+            // Blocks added after the reference pass belong to later coda layers; keep them.
+            let n = guided.len();
+            guided.extend(blocks.iter().skip(n).cloned());
+            blocks = guided;
         }
-        let oq: &[f32] = bytemuck::cast_slice(self.tensor("output_res_query.weight")?.1);
-        cur = mix(&blocks, &cur, oq, cfg.hidden, cfg.eps);
-        let on: &[f32] = bytemuck::cast_slice(self.tensor("output_norm.weight")?.1);
-        cur = rms_norm(&cur, on, cfg.eps);
-        let logits = self.mat("output.weight", &cur)?;
+
+        let logits = if self.loopcd.mode == LoopCdMode::Logits {
+            let (ref_cur, ref_blocks) = reference
+                .as_ref()
+                .expect("LoopCD reference pass was not captured");
+            // The weak pass must not append KV or shift conv history in the real cache.
+            let mut weak_st = branch_state(st, cfg.loop_end..cfg.n_layers);
+            let mut weak_cur = ref_cur.clone();
+            let mut weak_blocks = ref_blocks.clone();
+            for il in cfg.loop_end..cfg.n_layers {
+                weak_cur = self.layer(
+                    &mut weak_st,
+                    il,
+                    il,
+                    il,
+                    &weak_cur,
+                    &mut weak_blocks,
+                    None,
+                    tau,
+                )?;
+            }
+            let weak = self.coda(&weak_blocks, &weak_cur)?;
+            for il in cfg.loop_end..cfg.n_layers {
+                cur = self.layer(st, il, il, il, &cur, &mut blocks, None, tau)?;
+            }
+            let strong = self.coda(&blocks, &cur)?;
+            let w = self.loopcd.strength(&strong);
+            if std::env::var_os("INKLING2_DEBUG").is_some() {
+                eprintln!("loopcd: omega={w:.3}");
+            }
+            extrapolate(&strong, &weak, w)
+        } else {
+            for il in cfg.loop_end..cfg.n_layers {
+                cur = self.layer(st, il, il, il, &cur, &mut blocks, None, tau)?;
+            }
+            self.coda(&blocks, &cur)?
+        };
         st.pos += 1;
-        Ok(logits
-            .into_iter()
-            .take(cfg.vocab_unpadded)
-            .map(|v| {
-                if cfg.softcap != 0.0 {
-                    cfg.softcap * (v / cfg.softcap).tanh()
-                } else {
-                    v
-                }
-            })
-            .collect())
+        Ok(logits)
     }
 }
 
@@ -942,6 +1151,45 @@ pub fn generate(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn loopcd_zero_strength_is_identity() {
+        let strong = [1.0f32, -2.5, 3.25, 0.0];
+        let weak = [0.5f32, 4.0, -1.0, 9.0];
+        assert_eq!(extrapolate(&strong, &weak, 0.0), strong);
+        // Both variants reduce to the unguided logits at ω = 0.
+        assert_eq!(extrapolate(&strong, &weak, 0.0).len(), strong.len());
+        let w = 0.25;
+        let guided = extrapolate(&strong, &weak, w);
+        for (i, (&s, &r)) in strong.iter().zip(&weak).enumerate() {
+            assert!((guided[i] - (s + w * (s - r))).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn loopcd_adaptive_strength_from_top_two_margin() {
+        let fixed = LoopCd {
+            mode: LoopCdMode::Logits,
+            omega: 0.25,
+            adaptive: false,
+            ref_pass: 0,
+        };
+        assert_eq!(fixed.strength(&[5.0, 4.0, 0.0]), 0.25);
+
+        let adaptive = LoopCd {
+            adaptive: true,
+            omega: 1.0,
+            ..fixed
+        };
+        // exp(5), exp(4), exp(0) shifted by the max -> p1 ≈ 0.7275, p2 ≈ 0.2677.
+        let w = adaptive.strength(&[5.0, 4.0, 0.0]);
+        assert!((w - 0.54018).abs() < 1e-3, "adaptive ω = {w}");
+        assert!((0.0..=adaptive.omega).contains(&w));
+        // A settled prediction (dominant top-1) gets almost no guidance.
+        let settled = adaptive.strength(&[20.0, 0.0, -1.0]);
+        assert!(settled < 1e-6, "settled ω = {settled}");
+        assert_eq!(adaptive.strength(&[]), 0.0);
+    }
 
     #[test]
     fn apex_balanced_inventory() {

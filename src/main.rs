@@ -5,6 +5,7 @@ mod gpu;
 mod inkling2;
 mod iq_grids;
 mod kernels;
+mod mc_eval;
 mod model;
 mod quant;
 mod radix;
@@ -82,6 +83,12 @@ struct Cli {
     /// Total CPU thread budget; per-pool shares are derived from it.
     #[arg(long)]
     cpu_threads: Option<usize>,
+    /// Inkling-2: score a multiple-choice JSON dataset by candidate log-likelihood.
+    #[arg(long)]
+    mc_eval: Option<PathBuf>,
+    /// Limit the number of scored questions (0 = all).
+    #[arg(long, default = "0")]
+    mc_limit: usize,
 }
 
 /// Mutually exclusive ways to run the binary. Flags that select more than one are resolved
@@ -166,6 +173,9 @@ fn main() -> Result<()> {
     // Inkling-2 runs entirely on the CPU path with native quantized dots; creating a GPU
     // device here would fail on hosts without CUDA/wgpu before we ever reach the model.
     if gguf.meta_str("general.architecture")? == "inkling2_loop" {
+        if let Some(path) = args.mc_eval.as_deref() {
+            return mc_eval::run(&gguf, path, args.mc_limit);
+        }
         let tok = tokenizer::Tokenizer::from_gguf(&gguf)?;
         let text = if args.raw {
             args.prompts[0].clone()
@@ -367,6 +377,8 @@ mod tests {
             selftest,
             bench,
             cpu_threads: None,
+            mc_eval: None,
+            mc_limit: 0,
         }
     }
 
