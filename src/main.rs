@@ -1,4 +1,5 @@
 mod cpu_moe;
+mod fused;
 mod generate;
 mod gguf;
 mod gpu;

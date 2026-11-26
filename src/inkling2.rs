@@ -195,9 +195,7 @@ impl Config {
 }
 
 fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let sum: f32 = x.iter().map(|v| v * v).sum();
-    let scale = 1.0 / (sum / x.len() as f32 + eps).sqrt();
-    x.iter().zip(w).map(|(&v, &s)| v * scale * s).collect()
+    crate::vec::backend().rms_norm(x, w, eps)
 }
 
 /// Clip each row (head) of `x` to L2 norm <= threshold, after optional per-channel scale.
@@ -361,6 +359,17 @@ fn matvec_gguf(ty: GgmlType, raw: &[u8], rows: usize, cols: usize, x: &[f32]) ->
         return (0..rows)
             .into_par_iter()
             .map(|r| dot_q8(ty, &raw[r * rb..(r + 1) * rb], &qx, x))
+            .collect();
+    }
+    // Opt-in fused dequant+dot: same element order, no f32 scratch round-trip.
+    if std::env::var_os("INKLING2_FUSED_DOT").is_some() && crate::fused::supports(ty) {
+        use rayon::prelude::*;
+        return (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                crate::fused::dot_row(ty, &raw[r * rb..(r + 1) * rb], x)
+                    .expect("fused format checked by supports()")
+            })
             .collect();
     }
     // Default: exact dequantized dot. Matches llama.cpp's top-1 token on the APEX oracle.
