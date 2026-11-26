@@ -188,7 +188,7 @@ fn e8m0_half(e: u8) -> f32 {
 
 /// UE4M3 scale (4 exponent bits, bias 7, 3 mantissa bits), halved to match the doubled
 /// E2M1 table, as in ggml's `ggml_ue4m3_to_fp32`.
-fn ue4m3_half(e: u8) -> f32 {
+pub(crate) fn ue4m3_half(e: u8) -> f32 {
     if e == 0 || e == 0x7F {
         return 0.0;
     }
@@ -201,7 +201,7 @@ fn ue4m3_half(e: u8) -> f32 {
     raw * 0.5
 }
 
-const KVALUES_IQ4NL: [i8; 16] = [
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
