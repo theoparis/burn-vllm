@@ -5,6 +5,7 @@ mod gpu;
 mod inkling2;
 mod iq_grids;
 mod kernels;
+mod kolibri;
 mod model;
 mod quant;
 mod radix;
@@ -209,6 +210,43 @@ fn main() -> Result<()> {
         let secs = started.elapsed().as_secs_f64();
         eprintln!(
             "inkling2: {generated} tokens in {secs:.2}s ({:.2} tok/s)",
+            generated as f64 / secs.max(1e-6)
+        );
+        return Ok(());
+    }
+
+    if gguf.meta_str("general.architecture")? == "kolibri1" {
+        let tok = tokenizer::Tokenizer::from_gguf(&gguf)?;
+        let prompt = tok.encode(&args.prompts[0])?;
+        if std::env::var_os("INKLING2_DEBUG").is_some() {
+            eprintln!("kolibri1 prompt ids: {prompt:?}");
+        }
+        let model = kolibri::Model::new(&gguf)?;
+        let mut st = kolibri::State::new(model.config());
+        eprintln!(
+            "kolibri1: {} layers, {} experts, prompt {} tokens",
+            model.config().layers,
+            model.config().experts,
+            prompt.len()
+        );
+        let started = Instant::now();
+        let mut generated = 0usize;
+        kolibri::generate(
+            &model,
+            &mut st,
+            &prompt,
+            args.n,
+            args.temp.unwrap_or(1.0),
+            |id| {
+                print!("{}", String::from_utf8_lossy(&tok.token_bytes(id)));
+                std::io::stdout().flush().ok();
+                generated += 1;
+            },
+        )?;
+        println!();
+        let secs = started.elapsed().as_secs_f64();
+        eprintln!(
+            "kolibri1: {generated} tokens in {secs:.2}s ({:.2} tok/s)",
             generated as f64 / secs.max(1e-6)
         );
         return Ok(());

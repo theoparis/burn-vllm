@@ -94,6 +94,25 @@ pub struct Config {
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.meta_str("general.architecture")?;
+        // Kolibri 1.1 GGUFs carry arch="kolibri1" (llama.cpp's converter does not use a
+        // distinct 1.1 arch string). Refuse them by name using the 1.1-only marker KVs so a
+        // 1.1 file is never silently treated as 1.0.
+        if arch == "kolibri1"
+            && [
+                "kolibri1.attention.indexer.top_k",
+                "kolibri1.attention.indexer.types",
+                "kolibri1.attention.kv_source_map",
+                "kolibri1.attention.indexer.candidate_block_size",
+                "kolibri1.attention.indexer.candidate_top_k_blocks",
+                "kolibri1.leading_dense_block_count",
+            ]
+            .iter()
+            .any(|k| g.meta.contains_key(*k))
+        {
+            bail!(
+                "kolibri1_1 is not supported (GGUF reports arch kolibri1; detected 1.1 marker KVs)"
+            );
+        }
         let moe = arch == "qwen35moe";
         // Inkling-2 can be tabulated and its config parsed, but its forward pass is not
         // implemented yet. Parsing it here lets loaders fail later on a specific missing
@@ -2047,5 +2066,28 @@ impl Model {
         );
         self.gpu
             .moe_down(d, st.down.fmt, act, desc, ntiles, y, hidden, inter, max_cnt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Kolibri 1.1 GGUFs report `general.architecture=kolibri1`; the arch string alone must
+    /// not make us claim 1.0 support.
+    #[test]
+    fn kolibri_1_1_is_named() {
+        let path = Path::new("/mnt/models/Aleph-Alpha/Kolibri-1.1-GGUF/Kolibri-1.1-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: Kolibri 1.1 GGUF not present");
+            return;
+        }
+        let g = Gguf::open(path).unwrap();
+        let err = Config::from_gguf(&g).unwrap_err();
+        assert!(
+            err.to_string().contains("kolibri1_1"),
+            "unexpected error: {err:#}"
+        );
     }
 }
