@@ -2,6 +2,8 @@ mod cpu_moe;
 mod generate;
 mod gguf;
 mod gpu;
+mod hy4;
+mod hy4_tensors;
 mod inkling2;
 mod iq_grids;
 mod kernels;
@@ -163,6 +165,14 @@ fn main() -> Result<()> {
     enable_kernel_cache();
     let model_path = args.model.clone().unwrap_or_else(|| DEFAULT_MODEL.into());
     let gguf = gguf::Gguf::open(&model_path)?;
+    // Hy4-flash is P1 only: parse config and validate the shard-1 tensor inventory.
+    if gguf.meta_str("general.architecture")? == "hy_v4_flash" {
+        let cfg = hy4::Config::from_gguf(&gguf)?;
+        eprintln!("{}", cfg.summary());
+        hy4::validate(&gguf)?;
+        eprintln!("hy4: shard-1 tensor inventory OK");
+        return Ok(());
+    }
     // Inkling-2 runs entirely on the CPU path with native quantized dots; creating a GPU
     // device here would fail on hosts without CUDA/wgpu before we ever reach the model.
     if gguf.meta_str("general.architecture")? == "inkling2_loop" {
