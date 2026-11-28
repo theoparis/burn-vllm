@@ -9,10 +9,15 @@
 use crate::cpu_moe::{QuantX, dot_q8};
 use crate::gguf::{Gguf, TensorInfo};
 use crate::hy4::Config;
+use crate::q8k;
 use crate::quant::{GgmlType, dequant};
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Current forward position, used by HY4_DUMP_POS to isolate one prompt token.
+static DUMP_POS: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Route Q8_0 rows through the per-32 quantized-dot path (ggml's own scheme).
 /// HY4_NO_Q8DOT restores the exact dequantize-then-f32-dot path for A/B checks.
@@ -25,6 +30,24 @@ fn q8dot_enabled() -> bool {
 /// `qx` is the per-32 activation quantization of `x` (unused by scalar backends).
 fn q8dot_row(ty: GgmlType, row: &[u8], x: &[f32], qx: &QuantX) -> Option<f32> {
     (ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0).then(|| dot_q8(ty, row, qx, x))
+}
+
+/// Route K-quant expert rows through ggml's Q8_K dot kernels. Enabled by default;
+/// `HY4_NO_Q8K` restores the exact dequantize-then-f32-dot path for A/B checks.
+fn q8k_wire_enabled() -> bool {
+    std::env::var_os("HY4_NO_Q8K").is_none()
+        || std::env::var_os("HY4_Q8K_WIRE").is_some_and(|v| v == "1")
+}
+
+/// ggml's `ggml_cpu_bf16_to_vec_dot_type` widens BF16 activations to f32 by
+/// truncating the low 16 mantissa bits. llama.cpp's expert matmuls see those
+/// BF16-rounded values, so Q8_K must quantize the truncated form: round-to-nearest
+/// BF16 changes the q8 quants enough to break greedy parity.
+#[inline]
+fn bf16_truncate(x: &[f32]) -> Vec<f32> {
+    x.iter()
+        .map(|&v| f32::from_bits(v.to_bits() & 0xffff_0000))
+        .collect()
 }
 
 pub struct State {
@@ -60,6 +83,12 @@ fn dump(name: &str, data: &[f32]) {
     let Ok(dir) = std::env::var("HY4_DUMP") else {
         return;
     };
+    if let Ok(pos) = std::env::var("HY4_DUMP_POS") {
+        let cur = DUMP_POS.load(std::sync::atomic::Ordering::Relaxed);
+        if pos.parse::<usize>().is_ok_and(|p| p != cur) {
+            return;
+        }
+    }
     let path = format!("{dir}/rust_s0_{name}.bin");
     use std::io::Write;
     if let Ok(mut f) = std::fs::File::create(path) {
@@ -115,6 +144,10 @@ fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32]) -> Vec<f32> {
 }
 
 /// Expert slice of a 3-D [cols, rows, experts] weight.
+///
+/// Q4_K/Q5_K/Q6_K rows use ggml's Q8_K kernel with BF16-truncated activations,
+/// matching llama.cpp's `ggml_mul_mat_id` path. `HY4_NO_Q8K` A/Bs against exact
+/// dequantize-then-f32-dot.
 fn expert_matvec(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32]) -> Vec<f32> {
     ensure_dims(t, x.len());
     let cols = t.dims[0] as usize;
@@ -127,6 +160,31 @@ fn expert_matvec(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32]) -> Vec<f32> {
         (0..rows)
             .into_par_iter()
             .map(|r| dot_q8(t.ty, &base[r * rb..(r + 1) * rb], &qx, x))
+            .collect()
+    } else if q8k_wire_enabled()
+        && matches!(t.ty, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)
+        && x.len() % q8k::QK_K == 0
+    {
+        let xq = bf16_truncate(x);
+        let blocks = q8k::quantize_q8_k_blocks(&xq).expect("q8k activation blocks");
+        let bb = t.ty.block().1;
+        (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                let row = &base[r * rb..(r + 1) * rb];
+                let mut sum = 0.0f32;
+                for (bi, q) in blocks.iter().enumerate() {
+                    let w = &row[bi * bb..];
+                    sum += match t.ty {
+                        GgmlType::Q4K => q8k::dot_q4_k_q8_k(w, q),
+                        GgmlType::Q5K => q8k::dot_q5_k_q8_k(w, q),
+                        GgmlType::Q6K => q8k::dot_q6_k_q8_k(w, q),
+                        _ => unreachable!(),
+                    }
+                    .expect("q8k dot");
+                }
+                sum
+            })
             .collect()
     } else {
         (0..rows)
@@ -241,6 +299,7 @@ impl<'a> Model<'a> {
         let g = self.g;
         let cfg = &self.cfg;
         let pos = st.pos;
+        DUMP_POS.store(pos, Ordering::Relaxed);
         let (te, traw) = tensor(g, "token_embd.weight")?;
         if std::env::var_os("HY4_DEBUG_OFFSETS").is_some() {
             eprintln!(
@@ -522,7 +581,7 @@ impl<'a> Model<'a> {
                 // Dense FFN at layer 0; other PLE layers use MoE too in llama.cpp.
                 dense_ffn(g, &b, &ffn_in)?
             } else {
-                moe_ffn(g, &b, &ffn_in, cfg)?
+                moe_ffn(g, &b, &ffn_in, cfg, il)?
             };
             let pfn = f32_vec(g, &format!("{b}post_ffw_norm.weight"))?;
             let ffn_out = rms_norm(&ffn_out, &pfn, cfg.eps);
@@ -565,6 +624,7 @@ impl<'a> Model<'a> {
             g.bytes(g.tensor("output.weight")?),
             &hidden,
         );
+        dump("logits", &logits);
         st.pos += 1;
         st.prev_token = token;
         st.tokens.push(token);
@@ -603,7 +663,7 @@ fn dense_ffn(g: &Gguf, b: &str, x: &[f32]) -> Result<Vec<f32>> {
     mv(g, &format!("{b}ffn_down.weight"), &act)
 }
 
-fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
+fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config, il: usize) -> Result<Vec<f32>> {
     let logits = mv(g, &format!("{b}ffn_gate_inp.weight"), x)?;
     let bias = f32_vec(g, &format!("{b}exp_probs_b.bias"))?;
     let mut sel: Vec<(f32, usize)> = logits
@@ -620,6 +680,10 @@ fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
         *w = *w / wsum * cfg.expert_weights_scale;
     }
     let routed = mv(g, &format!("{b}ffn_routed_down.weight"), x)?;
+    if il == 1 {
+        dump("moe_routed_l1", &routed);
+        dump("ffn_norm_l1", x);
+    }
     let mut out = vec![0.0f32; cfg.hidden];
     for (idx, &(_, e)) in sel.iter().enumerate() {
         let up = emv(g, &format!("{b}ffn_up_exps.weight"), e, &routed)?;
@@ -634,6 +698,12 @@ fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
             })
             .collect();
         let down = emv(g, &format!("{b}ffn_down_exps.weight"), e, &act)?;
+        if il == 1 {
+            dump(&format!("moe_up_l1_e{e}"), &up);
+            dump(&format!("moe_gate_l1_e{e}"), &gate);
+            dump(&format!("moe_situ_l1_e{e}"), &act);
+            dump(&format!("moe_down_l1_e{e}"), &down);
+        }
         let latent = mv(g, &format!("{b}ffn_routed_up.weight"), &down)?;
         for (o, &v) in out.iter_mut().zip(&latent) {
             *o += weights[idx] * v;
@@ -656,6 +726,18 @@ fn moe_ffn(g: &Gguf, b: &str, x: &[f32], cfg: &Config) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_truncate_matches_ggml_widening() {
+        // ggml_cpu_bf16_to_fp32 widens a BF16 word by shifting it into the
+        // top half of an f32 (truncation, not round-to-nearest-even).
+        let x = [1.0f32, -1.5, 0.1, f32::from_bits(0x3f80_ffff)];
+        let got = bf16_truncate(&x);
+        for (&v, &g) in x.iter().zip(&got) {
+            assert_eq!(g.to_bits(), v.to_bits() & 0xffff_0000);
+        }
+        assert_ne!(got[3].to_bits(), f32::from_bits(0x3f80_ffff).to_bits());
+    }
 
     #[test]
     fn hc_gates_match_llama_cpp_oracle() {

@@ -23,7 +23,7 @@
 use anyhow::{Result, bail};
 use half::f16;
 
-const QK_K: usize = 256;
+pub const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
 const Q4_K_SIZE: usize = 144;
 const Q5_K_SIZE: usize = 176;
