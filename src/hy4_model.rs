@@ -24,8 +24,7 @@ fn q8dot_enabled() -> bool {
 /// Dot one weight row with `x`, using the quantized path for Q8_0 rows when enabled.
 /// `qx` is the per-32 activation quantization of `x` (unused by scalar backends).
 fn q8dot_row(ty: GgmlType, row: &[u8], x: &[f32], qx: &QuantX) -> Option<f32> {
-    (ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0)
-        .then(|| dot_q8(ty, row, qx, x))
+    (ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0).then(|| dot_q8(ty, row, qx, x))
 }
 
 pub struct State {
