@@ -19,6 +19,8 @@ pub struct State {
     pub prev_token: u32,
     /// Token history (oldest first) for the Engram n-gram hash.
     pub tokens: Vec<u32>,
+    /// Indexer LID rows [iv(128), ig(128)] per sparse layer, cell order.
+    pub lid: Vec<Vec<Vec<f32>>>,
 }
 
 impl State {
@@ -28,6 +30,7 @@ impl State {
             pos: 0,
             prev_token: 0,
             tokens: Vec::new(),
+            lid: vec![Vec::new(); cfg.n_layers - cfg.nextn_layers],
         }
     }
 }
@@ -355,7 +358,27 @@ impl<'a> Model<'a> {
                 dump("sinks", &sinks);
                 dump("q_pe", &qb);
             }
-            let keys = &st.kv[il];
+            // Optional real pooled indexer; short prompts can use the all-causal stub.
+            let selected_keys: Option<Vec<Vec<f32>>> = if std::env::var_os("HY4_USE_INDEXER")
+                .is_some()
+                && cfg.indexer_types.get(il).copied().unwrap_or(false)
+            {
+                let idx = crate::hy4_indexer::Indexer::new(g, &b, cfg)?;
+                let row = idx.lid_row(&cur)?;
+                st.lid[il].push(row);
+                let sel = idx.select(&cur, &qr, pos, &st.lid[il], rope_base)?;
+                let n_cells = st.kv[il].len();
+                let mut seen = std::collections::HashSet::new();
+                Some(
+                    sel.into_iter()
+                        .filter(|&i| i < n_cells && seen.insert(i))
+                        .map(|i| st.kv[il][i].clone())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let keys: &[Vec<f32>] = selected_keys.as_deref().unwrap_or(&st.kv[il]);
             let scale = 1.0 / (cfg.key_len_mla as f32).sqrt();
             let mut attn = vec![0.0f32; heads * cfg.value_len];
             for h in 0..heads {
