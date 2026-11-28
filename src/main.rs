@@ -11,6 +11,7 @@ mod inkling2;
 mod iq_grids;
 mod kernels;
 mod model;
+mod q8k;
 mod quant;
 mod radix;
 mod sampler;
