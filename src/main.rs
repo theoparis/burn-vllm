@@ -2,10 +2,16 @@ mod cpu_moe;
 mod generate;
 mod gguf;
 mod gpu;
+mod hy4;
+mod hy4_engram;
+mod hy4_indexer;
+mod hy4_model;
+mod hy4_tensors;
 mod inkling2;
 mod iq_grids;
 mod kernels;
 mod model;
+mod q8k;
 mod quant;
 mod radix;
 mod sampler;
@@ -163,6 +169,49 @@ fn main() -> Result<()> {
     enable_kernel_cache();
     let model_path = args.model.clone().unwrap_or_else(|| DEFAULT_MODEL.into());
     let gguf = gguf::Gguf::open(&model_path)?;
+    // Hy4-flash CPU forward (P2): greedy decode with explicit prompt IDs.
+    if gguf.meta_str("general.architecture")? == "hy_v4_flash" {
+        let cfg = hy4::Config::from_gguf(&gguf)?;
+        eprintln!("{}", cfg.summary());
+        hy4::validate(&gguf)?;
+        let prompt: Vec<u32> = match std::env::var("HY4_PROMPT_IDS") {
+            Ok(v) => v
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect(),
+            Err(_) => {
+                let tok = tokenizer::Tokenizer::from_gguf(&gguf)?;
+                tok.encode(args.prompts[0].as_str())?
+            }
+        };
+        let shard2 = model_path
+            .to_string_lossy()
+            .replace("-00001-of-00002.gguf", "-00002-of-00002.gguf");
+        let shard2 = if shard2 != model_path.to_string_lossy() {
+            Some(std::path::PathBuf::from(shard2))
+        } else {
+            None
+        };
+        let model = hy4_model::Model::new(&gguf, cfg, shard2)?;
+        let mut st = hy4_model::State::new(model.config());
+        let mut logits = Vec::new();
+        for &t in &prompt {
+            logits = model.forward(&mut st, t)?;
+        }
+        for _ in 0..args.n {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            print!("{} ", next);
+            std::io::stdout().flush().ok();
+            logits = model.forward(&mut st, next)?;
+        }
+        println!();
+        return Ok(());
+    }
     // Inkling-2 runs entirely on the CPU path with native quantized dots; creating a GPU
     // device here would fail on hosts without CUDA/wgpu before we ever reach the model.
     if gguf.meta_str("general.architecture")? == "inkling2_loop" {

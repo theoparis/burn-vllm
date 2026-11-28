@@ -1,5 +1,5 @@
 //! Byte-level BPE tokenizer built from GGUF `tokenizer.ggml.*` metadata (gpt2 model,
-//! qwen35 pre-tokenizer).
+//! qwen35/hy_v4 pre-tokenizers).
 
 use crate::gguf::Gguf;
 use anyhow::{Context, Result, bail};
@@ -7,6 +7,17 @@ use fancy_regex::Regex;
 use std::collections::HashMap;
 
 const QWEN35_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+// Transcribed from llama.cpp `src/llama-vocab.cpp`, `LLAMA_VOCAB_PRE_TYPE_HY_V4`
+// (shared with deepseek3-llm / hunyuan-dense / joyai-llm). llama.cpp applies these
+// three expressions in order, splitting the pieces produced by the previous one.
+// 1) numbers in groups of up to three digits,
+// 2) CJK runs (literal ranges, unlike the \p{...} expressions),
+// 3) letters with an optional leading punctuation/non-letter, punctuation, newlines,
+//    whitespace runs.
+const HY_V4_DIGITS: &str = r"\p{N}{1,3}";
+const HY_V4_CJK: &str = r"[一-龥぀-ゟ゠-ヿ]+";
+const HY_V4_MAIN: &str = r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]\^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##;
 
 pub struct Tokenizer {
     tokens: Vec<String>,
@@ -17,7 +28,8 @@ pub struct Tokenizer {
     is_special: Vec<bool>,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
-    pre: Regex,
+    /// Pre-tokenizer expressions, applied in order (llama.cpp semantics).
+    pre: Vec<Regex>,
     /// GPT-2 BPE with `ignore_merges`: a pre-token present verbatim in the vocab is
     /// emitted as one token instead of being split into byte symbols and merged.
     ignore_merges: bool,
@@ -51,9 +63,20 @@ impl Tokenizer {
         // inkling2 uses a GPT-2 regex pre-tokenizer; the Qwen35 regex is close enough for
         // ordinary text, but its merges must be skipped when a piece is a vocab token.
         let ignore_merges = pre == "inkling2";
-        if pre != "qwen35" && pre != "qwen2" && !ignore_merges {
-            eprintln!("warning: pre-tokenizer {pre:?} not recognized, using qwen35 regex");
-        }
+        // Hy4 (hy_v4) uses the deepseek3/hunyuan-dense regex set from llama.cpp.
+        // Its BPE does not use `ignore_merges`, matching our default.
+        let pre_patterns: &[&str] = if pre == "hy_v4" {
+            &[HY_V4_DIGITS, HY_V4_CJK, HY_V4_MAIN]
+        } else {
+            if pre != "qwen35" && pre != "qwen2" && !ignore_merges {
+                eprintln!("warning: pre-tokenizer {pre:?} not recognized, using qwen35 regex");
+            }
+            &[QWEN35_PRE]
+        };
+        let pre_regexes = pre_patterns
+            .iter()
+            .map(|p| Regex::new(p).context("invalid pre-tokenizer regex"))
+            .collect::<Result<Vec<_>>>()?;
         let tokens: Vec<String> = g
             .meta_array("tokenizer.ggml.tokens")?
             .iter()
@@ -103,7 +126,7 @@ impl Tokenizer {
             is_special,
             byte_to_char,
             char_to_byte,
-            pre: Regex::new(QWEN35_PRE)?,
+            pre: pre_regexes,
             ignore_merges,
             eos,
         })
@@ -143,8 +166,28 @@ impl Tokenizer {
     }
 
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
-        for m in self.pre.find_iter(text) {
-            let piece = m?.as_str();
+        // llama.cpp applies every pre-tokenizer expression in order, further splitting
+        // the pieces produced by the previous one (unmatched gaps are kept as pieces).
+        let mut pieces = vec![text];
+        for re in &self.pre {
+            let mut split = Vec::new();
+            for piece in pieces {
+                let mut last = 0;
+                for m in re.find_iter(piece) {
+                    let m = m?;
+                    if m.start() > last {
+                        split.push(&piece[last..m.start()]);
+                    }
+                    split.push(&piece[m.start()..m.end()]);
+                    last = m.end();
+                }
+                if last < piece.len() {
+                    split.push(&piece[last..]);
+                }
+            }
+            pieces = split;
+        }
+        for piece in pieces {
             if self.ignore_merges
                 && let Some(&id) = self.vocab.get(piece)
             {
@@ -193,6 +236,66 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HY4_MODEL: &str = "/mnt/models/hy4-flash-gguf/Hy4-flash-Q4_K_M-00001-of-00002.gguf";
+
+    fn hy4_tokenizer() -> Option<Tokenizer> {
+        let path = std::path::Path::new(HY4_MODEL);
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return None;
+        }
+        let g = Gguf::open(path).unwrap();
+        assert_eq!(g.meta_str("tokenizer.ggml.pre").unwrap(), "hy_v4");
+        Some(Tokenizer::from_gguf(&g).unwrap())
+    }
+
+    #[test]
+    fn hy4_prompt_matches_llama_cpp_oracle() {
+        let Some(tok) = hy4_tokenizer() else { return };
+        // llama.cpp oracle (`tokenize_hy4`): 12433,11,1215,2046,341
+        assert_eq!(
+            tok.encode("Hello, my name is").unwrap(),
+            [12433, 11, 1215, 2046, 341]
+        );
+    }
+
+    #[test]
+    fn hy4_pre_tokenizer_matches_llama_cpp_oracle() {
+        let Some(tok) = hy4_tokenizer() else { return };
+        // Token ids produced by the llama.cpp oracle for the same GGUF. In particular
+        // digits are grouped 1-3 at a time (`\p{N}{1,3}`), unlike the qwen35 fallback.
+        for (text, expected) in [
+            ("1234", vec![6636, 19]),
+            ("1234567", vec![6636, 17243, 22]),
+            ("1234567890", vec![6636, 17243, 29041, 15]),
+            ("abc123def", vec![22354, 6636, 2345]),
+            (",my name", vec![11, 4621, 2046]),
+            (
+                "Hello, world! It's 2026.",
+                vec![12433, 11, 3048, 0, 1177, 715, 220, 983, 21, 13],
+            ),
+            ("café", vec![66, 2592, 729]),
+            (
+                "naïve café — 東京 🚀",
+                vec![3231, 99726, 75970, 2227, 220, 37248, 96542, 222],
+            ),
+            ("  indented\ttab", vec![220, 1189, 31471, 197, 20484]),
+            ("foo_bar", vec![17726, 64006]),
+            ("It's 2026.", vec![2294, 715, 220, 983, 21, 13]),
+            (
+                "一龥぀ゟ゠ヿ",
+                vec![398, 3275, 98, 408, 222, 581, 253, 581, 254, 690, 123],
+            ),
+            ("Hello,world", vec![12433, 11, 25509]),
+            ("  hello   world", vec![220, 33146, 256, 3048]),
+        ] {
+            let ids = tok.encode(text).unwrap();
+            assert_eq!(ids, expected, "oracle mismatch for {text:?}");
+            let bytes: Vec<u8> = ids.iter().flat_map(|&i| tok.token_bytes(i)).collect();
+            assert_eq!(String::from_utf8(bytes).unwrap(), text);
+        }
+    }
 
     #[test]
     fn roundtrip() {
