@@ -6,11 +6,27 @@
 //!   prompt is shorter than ~2044 cells).
 //! - M-RoPE text inputs use one position plane, i.e. plain RoPE on the tail 64 dims.
 
+use crate::cpu_moe::{QuantX, dot_q8};
 use crate::gguf::{Gguf, TensorInfo};
 use crate::hy4::Config;
 use crate::quant::{GgmlType, dequant};
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
+use std::sync::OnceLock;
+
+/// Route Q8_0 rows through the per-32 quantized-dot path (ggml's own scheme).
+/// HY4_NO_Q8DOT restores the exact dequantize-then-f32-dot path for A/B checks.
+fn q8dot_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HY4_NO_Q8DOT").is_none())
+}
+
+/// Dot one weight row with `x`, using the quantized path for Q8_0 rows when enabled.
+/// `qx` is the per-32 activation quantization of `x` (unused by scalar backends).
+fn q8dot_row(ty: GgmlType, row: &[u8], x: &[f32], qx: &QuantX) -> Option<f32> {
+    (ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0)
+        .then(|| dot_q8(ty, row, qx, x))
+}
 
 pub struct State {
     /// MLA K rows [576] per layer, oldest first.
@@ -69,22 +85,34 @@ fn tensor<'a>(g: &'a Gguf, name: &str) -> Result<(&'a TensorInfo, &'a [u8])> {
     Ok((t, g.bytes(t)))
 }
 
-/// Exact dequantized matvec: `out[r] = sum_j dequant(w[r,j]) * x[j]`.
+/// Matvec: `out[r] = sum_j w[r,j] * x[j]`.
+///
+/// Q8_0 rows go through `dot_q8` with per-32 quantized activations, so the dequantized
+/// scratch row disappears and the optimized backends can fuse the dot. Every other
+/// format keeps the exact dequantize-then-f32-dot path.
 fn matvec(t: &TensorInfo, raw: &[u8], x: &[f32]) -> Vec<f32> {
     ensure_dims(t, x.len());
     let cols = t.dims[0] as usize;
     let rows = t.dims[1] as usize;
     let rb = t.ty.row_bytes(cols);
-    (0..rows)
-        .into_par_iter()
-        .map_init(
-            || vec![0.0f32; cols],
-            |scratch, r| {
-                dequant(t.ty, &raw[r * rb..(r + 1) * rb], scratch);
-                scratch.iter().zip(x).map(|(a, b)| a * b).sum()
-            },
-        )
-        .collect()
+    if t.ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0 {
+        let qx = QuantX::from_f32(x);
+        (0..rows)
+            .into_par_iter()
+            .map(|r| dot_q8(t.ty, &raw[r * rb..(r + 1) * rb], &qx, x))
+            .collect()
+    } else {
+        (0..rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0.0f32; cols],
+                |scratch, r| {
+                    dequant(t.ty, &raw[r * rb..(r + 1) * rb], scratch);
+                    scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+                },
+            )
+            .collect()
+    }
 }
 
 /// Expert slice of a 3-D [cols, rows, experts] weight.
@@ -95,16 +123,24 @@ fn expert_matvec(t: &TensorInfo, raw: &[u8], e: usize, x: &[f32]) -> Vec<f32> {
     let rb = t.ty.row_bytes(cols);
     let per = rows * rb;
     let base = &raw[e * per..(e + 1) * per];
-    (0..rows)
-        .into_par_iter()
-        .map_init(
-            || vec![0.0f32; cols],
-            |scratch, r| {
-                dequant(t.ty, &base[r * rb..(r + 1) * rb], scratch);
-                scratch.iter().zip(x).map(|(a, b)| a * b).sum()
-            },
-        )
-        .collect()
+    if t.ty == GgmlType::Q8_0 && q8dot_enabled() && x.len() % 32 == 0 {
+        let qx = QuantX::from_f32(x);
+        (0..rows)
+            .into_par_iter()
+            .map(|r| dot_q8(t.ty, &base[r * rb..(r + 1) * rb], &qx, x))
+            .collect()
+    } else {
+        (0..rows)
+            .into_par_iter()
+            .map_init(
+                || vec![0.0f32; cols],
+                |scratch, r| {
+                    dequant(t.ty, &base[r * rb..(r + 1) * rb], scratch);
+                    scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+                },
+            )
+            .collect()
+    }
 }
 
 fn ensure_dims(t: &TensorInfo, cols: usize) {
@@ -335,17 +371,20 @@ impl<'a> Model<'a> {
             }
             let kc = kt.dims[0] as usize; // 192
             let kr = kt.dims[1] as usize; // 512
+            let krb = kt.ty.row_bytes(kc);
             let kper = kraw.len() / heads;
             let mut qabsorbed = vec![0.0f32; kr * heads];
+            let mut scratch = vec![0.0f32; kc];
             for h in 0..heads {
                 let base = &kraw[h * kper..];
+                let x = &qnope[h * qnope_dim..(h + 1) * qnope_dim];
+                let qx = QuantX::from_f32(x);
                 for r in 0..kr {
-                    let mut s = 0.0f32;
-                    for c in 0..kc {
-                        let w = dequant_one(kt.ty, base, r * kc + c);
-                        s += w * qnope[h * qnope_dim + c];
-                    }
-                    qabsorbed[h * kr + r] = s;
+                    let row = &base[r * krb..(r + 1) * krb];
+                    qabsorbed[h * kr + r] = q8dot_row(kt.ty, row, x, &qx).unwrap_or_else(|| {
+                        dequant(kt.ty, row, &mut scratch);
+                        scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+                    });
                 }
             }
 
@@ -412,16 +451,20 @@ impl<'a> Model<'a> {
             let (vt, vraw) = tensor(g, &format!("{b}attn_v_b.weight"))?;
             let vc = vt.dims[0] as usize;
             let vr = vt.dims[1] as usize;
+            let vrb = vt.ty.row_bytes(vc);
             let vper = vraw.len() / heads;
             let mut decompressed = vec![0.0f32; heads * vr];
+            let mut scratch = vec![0.0f32; vc];
             for h in 0..heads {
                 let base = &vraw[h * vper..];
+                let x = &attn[h * vc..(h + 1) * vc];
+                let qx = QuantX::from_f32(x);
                 for r in 0..vr {
-                    let mut s = 0.0f32;
-                    for c in 0..vc {
-                        s += dequant_one(vt.ty, base, r * vc + c) * attn[h * vc + c];
-                    }
-                    decompressed[h * vr + r] = s;
+                    let row = &base[r * vrb..(r + 1) * vrb];
+                    decompressed[h * vr + r] = q8dot_row(vt.ty, row, x, &qx).unwrap_or_else(|| {
+                        dequant(vt.ty, row, &mut scratch);
+                        scratch.iter().zip(x).map(|(a, b)| a * b).sum()
+                    });
                 }
             }
             if il == 0 {
@@ -528,15 +571,6 @@ impl<'a> Model<'a> {
         st.tokens.push(token);
         Ok(logits)
     }
-}
-
-fn dequant_one(ty: GgmlType, row: &[u8], i: usize) -> f32 {
-    let (be, bb) = ty.block();
-    let block = i / be;
-    let off = block * bb;
-    let mut scratch = vec![0.0f32; be];
-    dequant(ty, &row[off..off + bb], &mut scratch);
-    scratch[i % be]
 }
 
 fn hc_ffn(g: &Gguf, b: &str, streams: &[f32], cfg: &Config) -> Result<(Vec<f32>, Vec<f32>)> {
